@@ -1,0 +1,705 @@
+// tftpxfer_tests.nv — one transfer at a time, a packet at a time.
+//
+// Each scripted case plays the peer by hand: it builds the datagram the
+// other end would send and checks the step the transfer answers with,
+// and the packet that step builds.  The expected steps are those of RFC
+// 1350 (lock-step, a short block ends the file, the receiver repeats an
+// ACK for a repeated DATA, the sender does not answer a repeated ACK) and
+// of RFC 2347, 2348 and 2349 (the OACK, the block size the server may
+// lower, the size stated in the request and answered in the OACK).
+//
+// `tftp_loop_tests.nv` runs two transfers against each other.
+
+use std.str
+use std.test
+use tftpwire
+use tftpxfer
+
+// A packet from a list of byte values.
+fn packet_of(xs: [Int]) -> tftpwire.TftpPacket
+    var p: tftpwire.TftpPacket = Vec.new()
+    for x in xs
+        let _ = p.push(x as u8)
+    p
+
+// A DATA packet for `block` with `n` bytes, all `fill`.
+fn data_of(block: Int, n: Int, fill: Int) -> tftpwire.TftpPacket
+    var p: tftpwire.TftpPacket = Vec.new()
+    let _ = tftpwire.build_data(var p, block)
+    for _i in 0..n
+        let _ = tftpwire.push_data(var p, fill)
+    p
+
+// An ACK packet.
+fn ack_of(block: Int) -> tftpwire.TftpPacket
+    var p: tftpwire.TftpPacket = Vec.new()
+    let _ = tftpwire.build_ack(var p, block)
+    p
+
+// An OACK packet.
+fn oack_of(blksize: Int, timeout: Int, tsize: Int) -> tftpwire.TftpPacket
+    var p: tftpwire.TftpPacket = Vec.new()
+    let _ = tftpwire.build_oack(var p, blksize, timeout, tsize)
+    p
+
+// An ERROR packet.
+fn error_of(code: Int) -> tftpwire.TftpPacket
+    var p: tftpwire.TftpPacket = Vec.new()
+    let _ = tftpwire.build_error(var p, code, "no")
+    p
+
+// The index of the first byte of the packet that differs from the
+// expected list, -2 when the lengths differ, and -1 when they agree.
+fn diff(var p: tftpwire.TftpPacket, want: [Int]) -> Int
+    if p.len() != list.len(want)
+        return -2
+    for i in 0..p.len()
+        if (p[i] as Int) != want[i]
+            return i
+    -1
+
+// A request packet for a server to read.
+fn request_of(opcode: Int, blksize: Int, timeout: Int, tsize: Int) -> tftpwire.TftpPacket
+    var p: tftpwire.TftpPacket = Vec.new()
+    let _ = tftpwire.build_request(var p, opcode, "fw.bin", "octet", blksize, timeout, tsize)
+    p
+
+@test
+fn test_a_client_reads_three_blocks() [io]
+    var x = tftpxfer.client_read(-1, -1, -1)
+    var out: tftpwire.TftpPacket = Vec.new()
+
+    test.case("the first step is the request, and it is the RRQ of RFC 1350")
+    let first = tftpxfer.start(var x)
+    test.assert_eq(first.action, tftpxfer.TFTP_ACT_REQUEST)
+    test.assert(tftpxfer.compose_request(var x, var out, "a.bin", "octet"))
+    test.assert_eq(diff(var out, [0x00, 0x01, 0x61, 0x2E, 0x62, 0x69, 0x6E, 0x00,
+                                  0x6F, 0x63, 0x74, 0x65, 0x74, 0x00]),
+                                  -1)
+    test.assert_eq(x.phase, tftpxfer.TFTP_PHASE_OPEN)
+    test.assert_eq(tftpxfer.block_size(x), 512)
+
+    test.case("DATA 1 is delivered and acknowledged")
+    var d1 = data_of(1, 512, 0x11)
+    let s1 = tftpxfer.on_packet(var x, var d1)
+    test.assert_eq(s1.action, tftpxfer.TFTP_ACT_ACK)
+    test.assert_eq(s1.block, 1)
+    test.assert(s1.deliver)
+    test.assert_eq(s1.len, 512)
+    test.assert(not s1.done)
+    test.assert(not s1.failed)
+    test.assert(tftpxfer.compose(var x, s1, var out))
+    test.assert_eq(diff(var out, [0x00, 0x04, 0x00, 0x01]), -1)
+    test.assert_eq(x.phase, tftpxfer.TFTP_PHASE_DATA)
+
+    test.case("DATA 2")
+    var d2 = data_of(2, 512, 0x22)
+    let s2 = tftpxfer.on_packet(var x, var d2)
+    test.assert_eq(s2.block, 2)
+    test.assert(s2.deliver)
+    test.assert(not s2.done)
+
+    test.case("a short DATA 3 ends the file")
+    var d3 = data_of(3, 100, 0x33)
+    let s3 = tftpxfer.on_packet(var x, var d3)
+    test.assert_eq(s3.action, tftpxfer.TFTP_ACT_ACK)
+    test.assert_eq(s3.block, 3)
+    test.assert(s3.deliver)
+    test.assert_eq(s3.len, 100)
+    test.assert(s3.done)
+    test.assert(tftpxfer.is_done(x))
+    test.assert(not tftpxfer.is_failed(x))
+
+    test.case("the final DATA again, because the ACK was lost, is answered again")
+    let again = tftpxfer.on_packet(var x, var d3)
+    test.assert_eq(again.action, tftpxfer.TFTP_ACT_ACK)
+    test.assert_eq(again.block, 3)
+    test.assert(not again.deliver)
+    test.assert(not again.done)
+    test.assert(tftpxfer.is_done(x))
+
+    test.case("anything else after the end is dropped")
+    var d4 = data_of(4, 512, 0x44)
+    test.assert_eq(tftpxfer.on_packet(var x, var d4).action, tftpxfer.TFTP_ACT_NONE)
+    var a = ack_of(1)
+    test.assert_eq(tftpxfer.on_packet(var x, var a).action, tftpxfer.TFTP_ACT_NONE)
+    test.assert_eq(tftpxfer.tick(var x, 100000).action, tftpxfer.TFTP_ACT_NONE)
+
+@test
+fn test_a_file_of_whole_blocks_ends_with_an_empty_one() [io]
+    var x = tftpxfer.client_read(-1, -1, -1)
+    let _ = tftpxfer.start(var x)
+    var d1 = data_of(1, 512, 1)
+    let s1 = tftpxfer.on_packet(var x, var d1)
+    test.assert(not s1.done)
+    var d2 = data_of(2, 0, 0)
+    let s2 = tftpxfer.on_packet(var x, var d2)
+    test.assert_eq(s2.block, 2)
+    test.assert(s2.deliver)
+    test.assert_eq(s2.len, 0)
+    test.assert(s2.done)
+
+@test
+fn test_a_receiver_takes_only_the_block_it_expects() [io]
+    var x = tftpxfer.client_read(-1, -1, -1)
+    let _ = tftpxfer.start(var x)
+    var d1 = data_of(1, 512, 1)
+    let _ = tftpxfer.on_packet(var x, var d1)
+
+    test.case("the same block again is acknowledged and not delivered")
+    let dup = tftpxfer.on_packet(var x, var d1)
+    test.assert_eq(dup.action, tftpxfer.TFTP_ACT_ACK)
+    test.assert_eq(dup.block, 1)
+    test.assert(not dup.deliver)
+
+    test.case("a block from the future is dropped")
+    var d5 = data_of(5, 512, 5)
+    let far = tftpxfer.on_packet(var x, var d5)
+    test.assert_eq(far.action, tftpxfer.TFTP_ACT_NONE)
+    test.assert(not far.deliver)
+
+    test.case("a block from the past is dropped")
+    var d0 = data_of(0, 512, 5)
+    test.assert_eq(tftpxfer.on_packet(var x, var d0).action, tftpxfer.TFTP_ACT_NONE)
+
+    test.case("DATA 1 before the transfer has been answered is expected, DATA 0 is not")
+    var y = tftpxfer.client_read(-1, -1, -1)
+    let _ = tftpxfer.start(var y)
+    test.assert_eq(tftpxfer.on_packet(var y, var d0).action, tftpxfer.TFTP_ACT_NONE)
+
+    test.case("a block longer than the block size is refused with error 4")
+    var z = tftpxfer.client_read(-1, -1, -1)
+    let _ = tftpxfer.start(var z)
+    var big = data_of(1, 513, 9)
+    let bad = tftpxfer.on_packet(var z, var big)
+    test.assert_eq(bad.action, tftpxfer.TFTP_ACT_ERROR)
+    test.assert_eq(bad.code, 4)
+    test.assert(bad.failed)
+    test.assert(tftpxfer.is_failed(z))
+    test.assert_eq(z.reason, tftpxfer.TFTP_FAIL_LOCAL)
+
+@test
+fn test_a_client_writes_three_blocks() [io]
+    var x = tftpxfer.client_write(-1, -1, -1)
+    var out: tftpwire.TftpPacket = Vec.new()
+
+    test.case("the first step is the WRQ")
+    let first = tftpxfer.start(var x)
+    test.assert_eq(first.action, tftpxfer.TFTP_ACT_REQUEST)
+    test.assert(tftpxfer.compose_request(var x, var out, "a", "octet"))
+    test.assert_eq(diff(var out, [0x00, 0x02, 0x61, 0x00, 0x6F, 0x63, 0x74, 0x65, 0x74, 0x00]), -1)
+
+    test.case("ACK 0 starts the data")
+    var a0 = ack_of(0)
+    let s1 = tftpxfer.on_packet(var x, var a0)
+    test.assert_eq(s1.action, tftpxfer.TFTP_ACT_DATA)
+    test.assert_eq(s1.block, 1)
+    test.assert(tftpxfer.compose(var x, s1, var out))
+    test.assert_eq(diff(var out, [0x00, 0x03, 0x00, 0x01]), -1)
+    tftpxfer.data_sent(var x, 512)
+
+    test.case("a repeated ACK 0 does not send DATA 1 a second time")
+    test.assert_eq(tftpxfer.on_packet(var x, var a0).action, tftpxfer.TFTP_ACT_NONE)
+
+    test.case("an ACK for a block that is not in flight is dropped")
+    var a9 = ack_of(9)
+    test.assert_eq(tftpxfer.on_packet(var x, var a9).action, tftpxfer.TFTP_ACT_NONE)
+
+    test.case("ACK 1 asks for block 2")
+    var a1 = ack_of(1)
+    let s2 = tftpxfer.on_packet(var x, var a1)
+    test.assert_eq(s2.action, tftpxfer.TFTP_ACT_DATA)
+    test.assert_eq(s2.block, 2)
+    tftpxfer.data_sent(var x, 512)
+
+    test.case("a repeated ACK 1 is dropped too")
+    test.assert_eq(tftpxfer.on_packet(var x, var a1).action, tftpxfer.TFTP_ACT_NONE)
+
+    test.case("block 3 is short, and its ACK ends the transfer")
+    var a2 = ack_of(2)
+    let s3 = tftpxfer.on_packet(var x, var a2)
+    test.assert_eq(s3.block, 3)
+    tftpxfer.data_sent(var x, 100)
+    var a3 = ack_of(3)
+    let done = tftpxfer.on_packet(var x, var a3)
+    test.assert_eq(done.action, tftpxfer.TFTP_ACT_NONE)
+    test.assert(done.done)
+    test.assert(tftpxfer.is_done(x))
+
+    test.case("a sender that is done drops what comes after")
+    test.assert_eq(tftpxfer.on_packet(var x, var a3).action, tftpxfer.TFTP_ACT_NONE)
+    var d = data_of(1, 4, 1)
+    test.assert_eq(tftpxfer.on_packet(var x, var d).action, tftpxfer.TFTP_ACT_NONE)
+
+@test
+fn test_a_client_reads_with_options() [io]
+    var x = tftpxfer.client_read(1024, 3, 0)
+    var out: tftpwire.TftpPacket = Vec.new()
+    let first = tftpxfer.start(var x)
+    test.assert_eq(first.action, tftpxfer.TFTP_ACT_REQUEST)
+
+    test.case("the RRQ carries blksize, timeout and a tsize of 0")
+    test.assert(tftpxfer.compose_request(var x, var out, "a", "octet"))
+    test.assert_eq(diff(var out, [0x00, 0x01, 0x61, 0x00, 0x6F, 0x63, 0x74, 0x65, 0x74, 0x00,
+                                  0x62, 0x6C, 0x6B, 0x73, 0x69, 0x7A, 0x65, 0x00,
+                                  0x31, 0x30, 0x32, 0x34, 0x00,
+                                  0x74, 0x69, 0x6D, 0x65, 0x6F, 0x75, 0x74, 0x00, 0x33, 0x00,
+                                  0x74, 0x73, 0x69, 0x7A, 0x65, 0x00, 0x30, 0x00]),
+                                  -1)
+    test.assert_eq(x.timeout_ms, 3000)
+
+    test.case("an OACK that agrees is acknowledged as block 0")
+    var o = oack_of(1024, 3, 673)
+    let s = tftpxfer.on_packet(var x, var o)
+    test.assert_eq(s.action, tftpxfer.TFTP_ACT_ACK)
+    test.assert_eq(s.block, 0)
+    test.assert(not s.deliver)
+    test.assert_eq(tftpxfer.block_size(x), 1024)
+    test.assert_eq(tftpxfer.total_size(x), 673)
+    test.assert_eq(x.timeout_ms, 3000)
+
+    test.case("blocks of the agreed size follow, and a shorter one ends the file")
+    var d1 = data_of(1, 1024, 1)
+    test.assert(not tftpxfer.on_packet(var x, var d1).done)
+    var d2 = data_of(2, 1023, 1)
+    test.assert(tftpxfer.on_packet(var x, var d2).done)
+
+@test
+fn test_a_client_accepts_a_smaller_block_size_and_nothing_larger() [io]
+    test.case("a smaller block size is taken")
+    var x = tftpxfer.client_read(1024, -1, -1)
+    let _ = tftpxfer.start(var x)
+    var o = oack_of(600, -1, -1)
+    test.assert_eq(tftpxfer.on_packet(var x, var o).action, tftpxfer.TFTP_ACT_ACK)
+    test.assert_eq(tftpxfer.block_size(x), 600)
+    test.assert_eq(tftpxfer.total_size(x), -1)
+
+    test.case("a larger one is refused with error 8")
+    var y = tftpxfer.client_read(1024, -1, -1)
+    let _ = tftpxfer.start(var y)
+    var big = oack_of(1025, -1, -1)
+    let r = tftpxfer.on_packet(var y, var big)
+    test.assert_eq(r.action, tftpxfer.TFTP_ACT_ERROR)
+    test.assert_eq(r.code, 8)
+    test.assert(r.failed)
+    test.assert(tftpxfer.is_failed(y))
+
+    test.case("a block size that was not asked for is refused")
+    var z = tftpxfer.client_read(-1, -1, -1)
+    let _ = tftpxfer.start(var z)
+    var unasked = oack_of(512, -1, -1)
+    test.assert_eq(tftpxfer.on_packet(var z, var unasked).code, 8)
+
+    test.case("a different timeout is refused, the same one is taken")
+    var t = tftpxfer.client_read(-1, 4, -1)
+    let _ = tftpxfer.start(var t)
+    var other = oack_of(-1, 5, -1)
+    test.assert_eq(tftpxfer.on_packet(var t, var other).code, 8)
+    var u = tftpxfer.client_read(-1, 4, -1)
+    let _ = tftpxfer.start(var u)
+    var same = oack_of(-1, 4, -1)
+    test.assert_eq(tftpxfer.on_packet(var u, var same).action, tftpxfer.TFTP_ACT_ACK)
+
+    test.case("a tsize that was not asked for is refused")
+    var v = tftpxfer.client_read(-1, -1, -1)
+    let _ = tftpxfer.start(var v)
+    var size = oack_of(-1, -1, 10)
+    test.assert_eq(tftpxfer.on_packet(var v, var size).code, 8)
+
+    test.case("an OACK with no option the client knows is refused")
+    var w = tftpxfer.client_read(1024, -1, -1)
+    let _ = tftpxfer.start(var w)
+    // The one option "windowsize" "4": 77 69 6E 64 6F 77 73 69 7A 65.
+    var unknown = packet_of([0x00, 0x06, 0x77, 0x69, 0x6E, 0x64, 0x6F, 0x77, 0x73, 0x69, 0x7A,
+                             0x65, 0x00, 0x34, 0x00])
+    test.assert_eq(tftpxfer.on_packet(var w, var unknown).code, 8)
+
+@test
+fn test_a_server_that_ignores_options_is_met_at_512() [io]
+    test.case("a read answered with DATA 1 at once")
+    var x = tftpxfer.client_read(1024, 5, 0)
+    let _ = tftpxfer.start(var x)
+    var d1 = data_of(1, 512, 1)
+    let s = tftpxfer.on_packet(var x, var d1)
+    test.assert_eq(s.action, tftpxfer.TFTP_ACT_ACK)
+    test.assert(not s.done)
+    test.assert_eq(tftpxfer.block_size(x), 512)
+    test.assert_eq(tftpxfer.total_size(x), -1)
+
+    test.case("a write answered with ACK 0")
+    var w = tftpxfer.client_write(1024, -1, 5000)
+    let _ = tftpxfer.start(var w)
+    var a0 = ack_of(0)
+    let first = tftpxfer.on_packet(var w, var a0)
+    test.assert_eq(first.action, tftpxfer.TFTP_ACT_DATA)
+    test.assert_eq(first.block, 1)
+    test.assert_eq(tftpxfer.block_size(w), 512)
+    tftpxfer.data_sent(var w, 511)
+    var a1 = ack_of(1)
+    test.assert(tftpxfer.on_packet(var w, var a1).done)
+
+@test
+fn test_a_client_that_writes_takes_the_oack_as_the_ack_of_the_request() [io]
+    var x = tftpxfer.client_write(1024, -1, 5000)
+    var out: tftpwire.TftpPacket = Vec.new()
+    let _ = tftpxfer.start(var x)
+    test.assert(tftpxfer.compose_request(var x, var out, "a", "octet"))
+    test.assert_eq(out[1] as Int, 2)
+    var o = oack_of(512, -1, 5000)
+    let s = tftpxfer.on_packet(var x, var o)
+    test.assert_eq(s.action, tftpxfer.TFTP_ACT_DATA)
+    test.assert_eq(s.block, 1)
+    test.assert_eq(tftpxfer.block_size(x), 512)
+    test.assert_eq(tftpxfer.total_size(x), 5000)
+
+@test
+fn test_errors_and_packets_that_have_no_place() [io]
+    test.case("an ERROR from the peer ends the transfer with its code")
+    var x = tftpxfer.client_read(-1, -1, -1)
+    let _ = tftpxfer.start(var x)
+    var e = error_of(1)
+    let s = tftpxfer.on_packet(var x, var e)
+    test.assert_eq(s.action, tftpxfer.TFTP_ACT_NONE)
+    test.assert(s.failed)
+    test.assert_eq(s.code, 1)
+    test.assert_eq(x.reason, tftpxfer.TFTP_FAIL_PEER)
+    test.assert_eq(x.code, 1)
+    test.assert(tftpxfer.is_failed(x))
+
+    test.case("a failed transfer drops everything")
+    var d1 = data_of(1, 4, 1)
+    test.assert_eq(tftpxfer.on_packet(var x, var d1).action, tftpxfer.TFTP_ACT_NONE)
+    test.assert_eq(tftpxfer.tick(var x, 100000).action, tftpxfer.TFTP_ACT_NONE)
+
+    test.case("a datagram that is not a TFTP packet is refused with error 4")
+    var y = tftpxfer.client_read(-1, -1, -1)
+    let _ = tftpxfer.start(var y)
+    var junk = packet_of([0x00])
+    let r = tftpxfer.on_packet(var y, var junk)
+    test.assert_eq(r.action, tftpxfer.TFTP_ACT_ERROR)
+    test.assert_eq(r.code, 4)
+    test.assert(r.failed)
+
+    test.case("the ERROR step builds the packet with the standard text")
+    var out: tftpwire.TftpPacket = Vec.new()
+    test.assert(tftpxfer.compose(var y, r, var out))
+    test.assert_eq(tftpwire.classify(var out), tftpwire.TFTP_OP_ERROR)
+    test.assert_eq(tftpwire.error_code(var out), 4)
+    test.assert_eq(out.len(), 4 + 22 + 1)
+
+    test.case("an ACK to a receiver, and DATA to a sender, have no place")
+    var a = tftpxfer.client_read(-1, -1, -1)
+    let _ = tftpxfer.start(var a)
+    var ack = ack_of(0)
+    test.assert_eq(tftpxfer.on_packet(var a, var ack).code, 4)
+    var b = tftpxfer.client_write(-1, -1, -1)
+    let _ = tftpxfer.start(var b)
+    var data = data_of(1, 4, 1)
+    test.assert_eq(tftpxfer.on_packet(var b, var data).code, 4)
+
+    test.case("a request in the middle of a transfer has no place")
+    var c = tftpxfer.client_read(-1, -1, -1)
+    let _ = tftpxfer.start(var c)
+    var rrq = request_of(1, -1, -1, -1)
+    test.assert_eq(tftpxfer.on_packet(var c, var rrq).code, 4)
+
+    test.case("an OACK after the transfer is under way has no place")
+    var d = tftpxfer.client_read(1024, -1, -1)
+    let _ = tftpxfer.start(var d)
+    var first = data_of(1, 512, 1)
+    let _ = tftpxfer.on_packet(var d, var first)
+    var late = oack_of(1024, -1, -1)
+    test.assert_eq(tftpxfer.on_packet(var d, var late).code, 4)
+
+    test.case("a server has no place for an OACK either")
+    var p = request_of(1, -1, -1, -1)
+    var s2 = tftpxfer.server(tftpwire.parse_request(var p), 512, 100)
+    let _ = tftpxfer.start(var s2)
+    var o = oack_of(1024, -1, -1)
+    test.assert_eq(tftpxfer.on_packet(var s2, var o).code, 4)
+
+    test.case("a datagram before start is dropped")
+    var idle = tftpxfer.client_read(-1, -1, -1)
+    test.assert_eq(tftpxfer.on_packet(var idle, var first).action, tftpxfer.TFTP_ACT_NONE)
+
+@test
+fn test_the_timer_repeats_the_last_packet_and_then_gives_up() [io]
+    test.case("before the wait is over nothing is sent")
+    var x = tftpxfer.client_read(-1, -1, -1)
+    tftpxfer.set_limits(var x, 100, 2)
+    test.assert_eq(tftpxfer.tick(var x, 500).action, tftpxfer.TFTP_ACT_NONE)
+    let first = tftpxfer.start(var x)
+    test.assert_eq(first.action, tftpxfer.TFTP_ACT_REQUEST)
+    test.assert_eq(tftpxfer.tick(var x, 40).action, tftpxfer.TFTP_ACT_NONE)
+    test.assert_eq(tftpxfer.tick(var x, 40).action, tftpxfer.TFTP_ACT_NONE)
+
+    test.case("when it is over the request goes again, and the timer restarts")
+    test.assert_eq(tftpxfer.tick(var x, 40).action, tftpxfer.TFTP_ACT_REQUEST)
+    test.assert_eq(tftpxfer.tick(var x, 99).action, tftpxfer.TFTP_ACT_NONE)
+    test.assert_eq(tftpxfer.tick(var x, 1).action, tftpxfer.TFTP_ACT_REQUEST)
+
+    test.case("after the last repeat the transfer fails with a timeout")
+    let end = tftpxfer.tick(var x, 100)
+    test.assert_eq(end.action, tftpxfer.TFTP_ACT_NONE)
+    test.assert(end.failed)
+    test.assert(tftpxfer.is_failed(x))
+    test.assert_eq(x.reason, tftpxfer.TFTP_FAIL_TIMEOUT)
+    test.assert_eq(tftpxfer.tick(var x, 100).action, tftpxfer.TFTP_ACT_NONE)
+
+    test.case("an answer resets the count of repeats")
+    var y = tftpxfer.client_read(-1, -1, -1)
+    tftpxfer.set_limits(var y, 100, 2)
+    let _ = tftpxfer.start(var y)
+    test.assert_eq(tftpxfer.tick(var y, 100).action, tftpxfer.TFTP_ACT_REQUEST)
+    test.assert_eq(tftpxfer.tick(var y, 100).action, tftpxfer.TFTP_ACT_REQUEST)
+    var d1 = data_of(1, 512, 1)
+    let _ = tftpxfer.on_packet(var y, var d1)
+    test.assert_eq(y.retries, 0)
+    test.assert_eq(tftpxfer.tick(var y, 100).action, tftpxfer.TFTP_ACT_ACK)
+    test.assert_eq(tftpxfer.tick(var y, 100).action, tftpxfer.TFTP_ACT_ACK)
+    test.assert(not tftpxfer.is_failed(y))
+
+    test.case("a dropped packet does not restart the timer")
+    var z = tftpxfer.client_write(-1, -1, -1)
+    tftpxfer.set_limits(var z, 100, 5)
+    let _ = tftpxfer.start(var z)
+    var a0 = ack_of(0)
+    let _ = tftpxfer.on_packet(var z, var a0)
+    tftpxfer.data_sent(var z, 512)
+    test.assert_eq(tftpxfer.tick(var z, 60).action, tftpxfer.TFTP_ACT_NONE)
+    test.assert_eq(tftpxfer.on_packet(var z, var a0).action, tftpxfer.TFTP_ACT_NONE)
+    let again = tftpxfer.tick(var z, 60)
+    test.assert_eq(again.action, tftpxfer.TFTP_ACT_DATA)
+    test.assert_eq(again.block, 1)
+
+@test
+fn test_limits_below_one_are_ignored() [io]
+    var x = tftpxfer.client_read(-1, -1, -1)
+    test.assert_eq(x.timeout_ms, 5000)
+    test.assert_eq(x.max_retries, 5)
+    tftpxfer.set_limits(var x, 0, 0)
+    test.assert_eq(x.timeout_ms, 5000)
+    test.assert_eq(x.max_retries, 5)
+    tftpxfer.set_limits(var x, 250, 9)
+    test.assert_eq(x.timeout_ms, 250)
+    test.assert_eq(x.max_retries, 9)
+
+@test
+fn test_start_is_once_and_a_request_option_out_of_range_is_not_asked() [io]
+    var x = tftpxfer.client_read(7, 0, -5)
+    var out: tftpwire.TftpPacket = Vec.new()
+    let _ = tftpxfer.start(var x)
+    test.assert(tftpxfer.compose_request(var x, var out, "a", "octet"))
+    test.assert_eq(out.len(), 10)
+    test.assert_eq(tftpxfer.start(var x).action, tftpxfer.TFTP_ACT_NONE)
+    var w = tftpxfer.client_write(65465, 256, tftpwire.TFTP_TSIZE_MAX + 1)
+    let _ = tftpxfer.start(var w)
+    test.assert(tftpxfer.compose_request(var w, var out, "a", "octet"))
+    test.assert_eq(out.len(), 10)
+
+@test
+fn test_a_server_reads_for_a_client() [io]
+    test.case("no options: DATA 1 at once, and the ACKs drive it")
+    var p = request_of(1, -1, -1, -1)
+    var x = tftpxfer.server(tftpwire.parse_request(var p), 1024, 1000)
+    var out: tftpwire.TftpPacket = Vec.new()
+    let s = tftpxfer.start(var x)
+    test.assert_eq(s.action, tftpxfer.TFTP_ACT_DATA)
+    test.assert_eq(s.block, 1)
+    test.assert(tftpxfer.compose(var x, s, var out))
+    test.assert_eq(diff(var out, [0x00, 0x03, 0x00, 0x01]), -1)
+    tftpxfer.data_sent(var x, 512)
+    var a1 = ack_of(1)
+    let s2 = tftpxfer.on_packet(var x, var a1)
+    test.assert_eq(s2.block, 2)
+    tftpxfer.data_sent(var x, 488)
+    var a2 = ack_of(2)
+    test.assert(tftpxfer.on_packet(var x, var a2).done)
+
+    test.case("blksize, timeout and tsize are answered in an OACK")
+    var q = request_of(1, 2048, 7, 0)
+    var y = tftpxfer.server(tftpwire.parse_request(var q), 1024, 70000)
+    let o = tftpxfer.start(var y)
+    test.assert_eq(o.action, tftpxfer.TFTP_ACT_OACK)
+    test.assert(tftpxfer.compose(var y, o, var out))
+    // 00 06 | blksize 1024 | timeout 7 | tsize 70000
+    test.assert_eq(diff(var out, [0x00, 0x06,
+                                  0x62, 0x6C, 0x6B, 0x73, 0x69, 0x7A, 0x65, 0x00,
+                                  0x31, 0x30, 0x32, 0x34, 0x00,
+                                  0x74, 0x69, 0x6D, 0x65, 0x6F, 0x75, 0x74, 0x00, 0x37, 0x00,
+                                  0x74, 0x73, 0x69, 0x7A, 0x65, 0x00,
+                                  0x37, 0x30, 0x30, 0x30, 0x30, 0x00]),
+                                  -1)
+    test.assert_eq(tftpxfer.block_size(y), 1024)
+    test.assert_eq(y.timeout_ms, 7000)
+
+    test.case("the OACK is repeated on a timeout, and ACK 0 releases DATA 1")
+    test.assert_eq(tftpxfer.tick(var y, 7000).action, tftpxfer.TFTP_ACT_OACK)
+    var a0 = ack_of(0)
+    let d1 = tftpxfer.on_packet(var y, var a0)
+    test.assert_eq(d1.action, tftpxfer.TFTP_ACT_DATA)
+    test.assert_eq(d1.block, 1)
+
+    test.case("a size the server does not know is not answered")
+    var r = request_of(1, -1, -1, 0)
+    var z = tftpxfer.server(tftpwire.parse_request(var r), 1024, -1)
+    test.assert_eq(tftpxfer.start(var z).action, tftpxfer.TFTP_ACT_DATA)
+
+    test.case("the server's own limit lowers the block size, and a smaller ask stays")
+    var big = request_of(1, 1024, -1, -1)
+    var capped = tftpxfer.server(tftpwire.parse_request(var big), 600, 10)
+    test.assert_eq(tftpxfer.block_size(capped), 600)
+    var small = request_of(1, 100, -1, -1)
+    var kept = tftpxfer.server(tftpwire.parse_request(var small), 600, 10)
+    test.assert_eq(tftpxfer.block_size(kept), 100)
+    var nolimit = request_of(1, 4000, -1, -1)
+    var most = tftpxfer.server(tftpwire.parse_request(var nolimit), 0, 10)
+    test.assert_eq(tftpxfer.block_size(most), 1024)
+    var above = tftpxfer.server(tftpwire.parse_request(var nolimit), 70000, 10)
+    test.assert_eq(tftpxfer.block_size(above), 1024)
+
+@test
+fn test_a_server_writes_for_a_client() [io]
+    test.case("no options: ACK 0, and DATA drives it")
+    var p = request_of(2, -1, -1, -1)
+    var x = tftpxfer.server(tftpwire.parse_request(var p), 1024, 1000)
+    var out: tftpwire.TftpPacket = Vec.new()
+    let s = tftpxfer.start(var x)
+    test.assert_eq(s.action, tftpxfer.TFTP_ACT_ACK)
+    test.assert_eq(s.block, 0)
+    test.assert(tftpxfer.compose(var x, s, var out))
+    test.assert_eq(diff(var out, [0x00, 0x04, 0x00, 0x00]), -1)
+    var d1 = data_of(1, 512, 1)
+    let r1 = tftpxfer.on_packet(var x, var d1)
+    test.assert_eq(r1.block, 1)
+    test.assert(r1.deliver)
+    test.assert_eq(tftpxfer.tick(var x, 5000).action, tftpxfer.TFTP_ACT_ACK)
+    var d2 = data_of(2, 7, 1)
+    test.assert(tftpxfer.on_packet(var x, var d2).done)
+
+    test.case("with options: an OACK, then DATA 1 is taken")
+    var q = request_of(2, 512, 3, 400)
+    var y = tftpxfer.server(tftpwire.parse_request(var q), 1024, 1000)
+    let o = tftpxfer.start(var y)
+    test.assert_eq(o.action, tftpxfer.TFTP_ACT_OACK)
+    test.assert(tftpxfer.compose(var y, o, var out))
+    test.assert_eq(tftpwire.parse_options(var out, 2).tsize, 400)
+    test.assert_eq(tftpwire.parse_options(var out, 2).blksize, 512)
+    test.assert_eq(tftpxfer.total_size(y), 400)
+    // DATA 0 in this phase is not a block.
+    var d0 = data_of(0, 4, 1)
+    test.assert_eq(tftpxfer.on_packet(var y, var d0).action, tftpxfer.TFTP_ACT_NONE)
+    let got = tftpxfer.on_packet(var y, var d1)
+    test.assert_eq(got.block, 1)
+    test.assert(got.deliver)
+
+    test.case("a file larger than the room is refused with error 3")
+    var big = request_of(2, -1, -1, 5000)
+    var z = tftpxfer.server(tftpwire.parse_request(var big), 1024, 4096)
+    let e = tftpxfer.start(var z)
+    test.assert_eq(e.action, tftpxfer.TFTP_ACT_ERROR)
+    test.assert_eq(e.code, 3)
+    test.assert(e.failed)
+    test.assert(tftpxfer.is_failed(z))
+    test.assert(tftpxfer.compose(var z, e, var out))
+    test.assert_eq(tftpwire.error_code(var out), 3)
+
+    test.case("a file that fits, and a server with no limit, are taken")
+    var fits = request_of(2, -1, -1, 4096)
+    var ok1 = tftpxfer.server(tftpwire.parse_request(var fits), 1024, 4096)
+    test.assert_eq(tftpxfer.start(var ok1).action, tftpxfer.TFTP_ACT_OACK)
+    var open = request_of(2, -1, -1, 99999)
+    var ok2 = tftpxfer.server(tftpwire.parse_request(var open), 1024, -1)
+    test.assert_eq(tftpxfer.start(var ok2).action, tftpxfer.TFTP_ACT_OACK)
+    var nosize = request_of(2, -1, -1, -1)
+    var ok3 = tftpxfer.server(tftpwire.parse_request(var nosize), 1024, 10)
+    test.assert_eq(tftpxfer.start(var ok3).action, tftpxfer.TFTP_ACT_ACK)
+
+@test
+fn test_a_server_refuses_a_request_that_did_not_parse() [io]
+    var junk = packet_of([0x00, 0x01, 0x61])
+    var x = tftpxfer.server(tftpwire.parse_request(var junk), 1024, 100)
+    let s = tftpxfer.start(var x)
+    test.assert_eq(s.action, tftpxfer.TFTP_ACT_ERROR)
+    test.assert_eq(s.code, 4)
+    test.assert(s.failed)
+
+@test
+fn test_compose_builds_each_packet_a_step_asks_for() [io]
+    var x = tftpxfer.client_read(-1, -1, -1)
+    var out: tftpwire.TftpPacket = Vec.new()
+    let quiet = tftpxfer.start(var x)
+    test.case("the request is not built by compose")
+    test.assert(not tftpxfer.compose(var x, quiet, var out))
+    test.assert_eq(out.len(), 0)
+    test.case("a step that sends nothing builds nothing")
+    test.assert(not tftpxfer.compose(var x, tftpxfer.tick(var x, 1), var out))
+    test.assert_eq(out.len(), 0)
+    test.case("an ACK, a DATA header and an ERROR")
+    let ack = tftpxfer.TftpStep { action: tftpxfer.TFTP_ACT_ACK, block: 65535, code: 0,
+                                  deliver: false, len: 0, done: false, failed: false }
+    test.assert(tftpxfer.compose(var x, ack, var out))
+    test.assert_eq(diff(var out, [0x00, 0x04, 0xFF, 0xFF]), -1)
+    let data = tftpxfer.TftpStep { action: tftpxfer.TFTP_ACT_DATA, block: 258, code: 0,
+                                   deliver: false, len: 0, done: false, failed: false }
+    test.assert(tftpxfer.compose(var x, data, var out))
+    test.assert_eq(diff(var out, [0x00, 0x03, 0x01, 0x02]), -1)
+    let err = tftpxfer.TftpStep { action: tftpxfer.TFTP_ACT_ERROR, block: 0, code: 1,
+                                  deliver: false, len: 0, done: false, failed: true }
+    test.assert(tftpxfer.compose(var x, err, var out))
+    test.assert_eq(tftpwire.error_code(var out), 1)
+    test.case("an OACK step with nothing agreed builds nothing")
+    let oack = tftpxfer.TftpStep { action: tftpxfer.TFTP_ACT_OACK, block: 0, code: 0,
+                                   deliver: false, len: 0, done: false, failed: false }
+    test.assert(not tftpxfer.compose(var x, oack, var out))
+    test.case("a server's transfer builds no request")
+    var p = request_of(1, -1, -1, -1)
+    var s = tftpxfer.server(tftpwire.parse_request(var p), 512, 10)
+    test.assert(not tftpxfer.compose_request(var s, var out, "a", "octet"))
+    test.assert_eq(out.len(), 0)
+    test.case("a request that does not fit builds nothing")
+    test.assert(not tftpxfer.compose_request(var x, var out, str.repeat("x", 1100), "octet"))
+    test.assert_eq(out.len(), 0)
+
+// A transfer in the middle of a file, at `block`: what 65534 blocks would
+// have left, without moving them.
+fn at_block(sending: Bool, block: Int) -> tftpxfer.TftpXfer
+    tftpxfer.TftpXfer { client: true, sending: sending, phase: tftpxfer.TFTP_PHASE_DATA,
+                        block: block, blksize: 512, timeout_ms: 5000, tsize: -1,
+                        want_blksize: -1, want_timeout: -1, want_tsize: -1,
+                        oack_blksize: -1, oack_timeout: -1, oack_tsize: -1, retries: 0,
+                        max_retries: 5, waited: 0, last_act: tftpxfer.TFTP_ACT_NONE,
+                        last_block: block, last_data: false, reason: 0, code: 0 }
+
+@test
+fn test_block_numbers_wrap_from_65535_to_0() [io]
+    test.case("a receiver that has acknowledged 65534 takes 65535, then 0, then 1")
+    var x = at_block(false, 65534)
+    var d = data_of(65535, 512, 7)
+    let s = tftpxfer.on_packet(var x, var d)
+    test.assert_eq(s.action, tftpxfer.TFTP_ACT_ACK)
+    test.assert_eq(s.block, 65535)
+    test.assert(s.deliver)
+    var d0 = data_of(0, 512, 7)
+    let wrapped = tftpxfer.on_packet(var x, var d0)
+    test.assert_eq(wrapped.action, tftpxfer.TFTP_ACT_ACK)
+    test.assert_eq(wrapped.block, 0)
+    test.assert(wrapped.deliver)
+    var d1 = data_of(1, 5, 7)
+    let end = tftpxfer.on_packet(var x, var d1)
+    test.assert_eq(end.block, 1)
+    test.assert(end.done)
+
+    test.case("block 65535 again after block 0 is a block from the past")
+    var y = at_block(false, 0)
+    test.assert_eq(tftpxfer.on_packet(var y, var d).action, tftpxfer.TFTP_ACT_NONE)
+
+    test.case("a sender in flight with 65535 goes on to 0, then 1")
+    var w = at_block(true, 65535)
+    var a = ack_of(65535)
+    let next = tftpxfer.on_packet(var w, var a)
+    test.assert_eq(next.action, tftpxfer.TFTP_ACT_DATA)
+    test.assert_eq(next.block, 0)
+    tftpxfer.data_sent(var w, 512)
+    var a0 = ack_of(0)
+    test.assert_eq(tftpxfer.on_packet(var w, var a0).block, 1)

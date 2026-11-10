@@ -1,0 +1,406 @@
+// tftpwire_tests.nv — the packets of TFTP, byte by byte.
+//
+// THE VECTORS ARE DERIVED BY HAND from the layouts in RFC 1350, 2347 and
+// 2349, not recorded from this code.  Each is worked out in the comment
+// above it.  ASCII values used throughout: 'a' 0x61, '.' 0x2E, 'b' 0x62,
+// 'i' 0x69, 'n' 0x6E, 'o' 0x6F, 'c' 0x63, 't' 0x74, 'e' 0x65, '0' 0x30,
+// '1' 0x31, '2' 0x32, '3' 0x33, '4' 0x34, '5' 0x35, '6' 0x36, '7' 0x37.
+
+use std.str
+use std.test
+use tftpwire
+
+// The index of the first byte of the packet that differs from the
+// expected list, -2 when the lengths differ, and -1 when they agree.
+fn diff(var p: tftpwire.TftpPacket, want: [Int]) -> Int
+    if p.len() != list.len(want)
+        return -2
+    for i in 0..p.len()
+        if (p[i] as Int) != want[i]
+            return i
+    -1
+
+// A packet from a list of byte values.
+fn packet_of(xs: [Int]) -> tftpwire.TftpPacket
+    var p: tftpwire.TftpPacket = Vec.new()
+    for x in xs
+        let _ = p.push(x as u8)
+    p
+
+@test
+fn test_the_five_packets_byte_by_byte() [io]
+    // RRQ for "a.bin" in "octet": opcode 00 01, then the name and its
+    // zero, then the mode and its zero.
+    //   00 01 | 61 2E 62 69 6E 00 | 6F 63 74 65 74 00
+    test.case("a read request, 14 bytes")
+    var p: tftpwire.TftpPacket = Vec.new()
+    test.assert(tftpwire.build_request(var p, tftpwire.TFTP_OP_RRQ, "a.bin", "octet", -1, -1, -1))
+    test.assert_eq(diff(var p, [0x00, 0x01, 0x61, 0x2E, 0x62, 0x69, 0x6E, 0x00,
+                                0x6F, 0x63, 0x74, 0x65, 0x74, 0x00]),
+                                -1)
+
+    // RFC 2349's example of a request that asks for the size: the option
+    // "tsize" with the value "0".  Opcode 00 02 for a write here.
+    //   00 02 | 61 00 | 6F 63 74 65 74 00 | 74 73 69 7A 65 00 | 30 00
+    test.case("a write request with the tsize option stated")
+    test.assert(tftpwire.build_request(var p, tftpwire.TFTP_OP_WRQ, "a", "octet", -1, -1, 0))
+    test.assert_eq(diff(var p, [0x00, 0x02, 0x61, 0x00, 0x6F, 0x63, 0x74, 0x65, 0x74, 0x00,
+                                0x74, 0x73, 0x69, 0x7A, 0x65, 0x00, 0x30, 0x00]),
+                                -1)
+
+    // All three options, in the order blksize, timeout, tsize:
+    // "blksize" 62 6C 6B 73 69 7A 65, "1024" 31 30 32 34,
+    // "timeout" 74 69 6D 65 6F 75 74, "3" 33, "tsize" 74 73 69 7A 65,
+    // "512" 35 31 32.
+    test.case("all three options")
+    test.assert(tftpwire.build_request(var p, tftpwire.TFTP_OP_RRQ, "a", "octet", 1024, 3, 512))
+    test.assert_eq(diff(var p, [0x00, 0x01, 0x61, 0x00, 0x6F, 0x63, 0x74, 0x65, 0x74, 0x00,
+                                0x62, 0x6C, 0x6B, 0x73, 0x69, 0x7A, 0x65, 0x00,
+                                0x31, 0x30, 0x32, 0x34, 0x00,
+                                0x74, 0x69, 0x6D, 0x65, 0x6F, 0x75, 0x74, 0x00, 0x33, 0x00,
+                                0x74, 0x73, 0x69, 0x7A, 0x65, 0x00, 0x35, 0x31, 0x32, 0x00]),
+                                -1)
+
+    // DATA block 0x0102 with two bytes: 00 03 | 01 02 | AA BB.
+    test.case("a data packet")
+    test.assert(tftpwire.build_data(var p, 0x0102))
+    test.assert(tftpwire.push_data(var p, 0xAA))
+    test.assert(tftpwire.push_data(var p, 0xBB))
+    test.assert_eq(diff(var p, [0x00, 0x03, 0x01, 0x02, 0xAA, 0xBB]), -1)
+
+    // ACK block 7: 00 04 | 00 07.  Block 65535 is FF FF.
+    test.case("an acknowledgement")
+    test.assert(tftpwire.build_ack(var p, 7))
+    test.assert_eq(diff(var p, [0x00, 0x04, 0x00, 0x07]), -1)
+    test.assert(tftpwire.build_ack(var p, 65535))
+    test.assert_eq(diff(var p, [0x00, 0x04, 0xFF, 0xFF]), -1)
+
+    // ERROR 1 "File not found": 00 05 | 00 01 | the text | 00.
+    test.case("an error packet")
+    test.assert(tftpwire.build_error(var p, 1, "File not found"))
+    test.assert_eq(p.len(), 19)
+    test.assert_eq(p[0] as Int, 0)
+    test.assert_eq(p[1] as Int, 5)
+    test.assert_eq(p[3] as Int, 1)
+    test.assert_eq(p[4] as Int, 0x46)
+    test.assert_eq(p[17] as Int, 0x64)
+    test.assert_eq(p[18] as Int, 0)
+
+    // RFC 2349's OACK: tsize "673".  00 06 | 74 73 69 7A 65 00 | 36 37 33 00.
+    test.case("an option acknowledgement, RFC 2349's example")
+    test.assert(tftpwire.build_oack(var p, -1, -1, 673))
+    test.assert_eq(diff(var p, [0x00, 0x06, 0x74, 0x73, 0x69, 0x7A, 0x65, 0x00,
+                                0x36, 0x37, 0x33, 0x00]),
+                                -1)
+
+@test
+fn test_numbers_are_written_as_decimal_digits() [io]
+    // The digits of a number are written most significant first with no
+    // leading zero, and a zero is one digit.
+    test.case("zero, ten, a hundred and a number with zeros inside")
+    var p: tftpwire.TftpPacket = Vec.new()
+    test.assert(tftpwire.build_oack(var p, -1, -1, 0))
+    test.assert_eq(diff(var p, [0x00, 0x06, 0x74, 0x73, 0x69, 0x7A, 0x65, 0x00, 0x30, 0x00]), -1)
+    test.assert(tftpwire.build_oack(var p, -1, -1, 10))
+    test.assert_eq(diff(var p, [0x00, 0x06, 0x74, 0x73, 0x69, 0x7A, 0x65, 0x00, 0x31, 0x30, 0x00]), -1)
+    test.assert(tftpwire.build_oack(var p, -1, -1, 1000100))
+    test.assert_eq(p.len(), 8 + 7 + 1)
+
+    test.case("the largest tsize has twelve digits")
+    test.assert(tftpwire.build_oack(var p, -1, -1, tftpwire.TFTP_TSIZE_MAX))
+    test.assert_eq(p.len(), 8 + 12 + 1)
+    test.assert_eq(p[8] as Int, 0x39)
+    test.assert_eq(p[19] as Int, 0x39)
+    let o = tftpwire.parse_options(var p, 2)
+    test.assert_eq(o.tsize, tftpwire.TFTP_TSIZE_MAX)
+
+    test.case("one more than the largest is refused")
+    test.assert(not tftpwire.build_oack(var p, -1, -1, tftpwire.TFTP_TSIZE_MAX + 1))
+    test.assert_eq(p.len(), 0)
+
+@test
+fn test_builders_refuse_what_cannot_be_sent() [io]
+    var p: tftpwire.TftpPacket = Vec.new()
+
+    test.case("a request needs a request opcode")
+    test.assert(not tftpwire.build_request(var p, tftpwire.TFTP_OP_DATA, "a", "octet", -1, -1, -1))
+    test.assert_eq(p.len(), 0)
+
+    test.case("a blksize below 8 or above 65464 is refused")
+    test.assert(not tftpwire.build_request(var p, tftpwire.TFTP_OP_RRQ, "a", "octet", 7, -1, -1))
+    test.assert(not tftpwire.build_request(var p, tftpwire.TFTP_OP_RRQ, "a", "octet", 65465, -1, -1))
+    test.assert(tftpwire.build_request(var p, tftpwire.TFTP_OP_RRQ, "a", "octet", 8, -1, -1))
+    test.assert(tftpwire.build_request(var p, tftpwire.TFTP_OP_RRQ, "a", "octet", 65464, -1, -1))
+
+    test.case("a timeout of 0 or 256 is refused")
+    test.assert(not tftpwire.build_request(var p, tftpwire.TFTP_OP_RRQ, "a", "octet", -1, 0, -1))
+    test.assert(not tftpwire.build_request(var p, tftpwire.TFTP_OP_RRQ, "a", "octet", -1, 256, -1))
+    test.assert(tftpwire.build_request(var p, tftpwire.TFTP_OP_RRQ, "a", "octet", -1, 1, -1))
+    test.assert(tftpwire.build_request(var p, tftpwire.TFTP_OP_RRQ, "a", "octet", -1, 255, -1))
+
+    test.case("a request that does not fit leaves the buffer empty")
+    let long = str.repeat("x", 1100)
+    test.assert(not tftpwire.build_request(var p, tftpwire.TFTP_OP_RRQ, long, "octet", -1, -1, -1))
+    test.assert_eq(p.len(), 0)
+    test.assert(not tftpwire.build_error(var p, 0, long))
+    test.assert_eq(p.len(), 0)
+
+    test.case("an OACK with no option is not built")
+    test.assert(not tftpwire.build_oack(var p, -1, -1, -1))
+    test.assert_eq(p.len(), 0)
+
+    test.case("a DATA packet stops accepting bytes at 1028")
+    test.assert(tftpwire.build_data(var p, 1))
+    for _i in 0..1024
+        test.assert(tftpwire.push_data(var p, 7))
+    test.assert_eq(p.len(), tftpwire.TFTP_PACKET_MAX)
+    test.assert(not tftpwire.push_data(var p, 7))
+
+    test.case("a request is built from the start of the buffer, not appended")
+    var q = packet_of([])
+    for _i in 0..1020
+        let _ = q.push(0 as u8)
+    test.assert(tftpwire.build_request(var q, tftpwire.TFTP_OP_RRQ, "a", "octet", -1, -1, -1))
+    test.assert_eq(q.len(), 10)
+
+    test.case("the tsize digits that do not fit leave the buffer empty")
+    test.assert(not tftpwire.build_request(var q, tftpwire.TFTP_OP_RRQ, str.repeat("x", 1010), "octet", -1, -1, 12345))
+    test.assert_eq(q.len(), 0)
+
+@test
+fn test_a_request_is_read_where_it_lies() [io]
+    test.case("a read request")
+    var p = packet_of([0x00, 0x01, 0x61, 0x2E, 0x62, 0x69, 0x6E, 0x00,
+                       0x6F, 0x63, 0x74, 0x65, 0x74, 0x00])
+    let r = tftpwire.parse_request(var p)
+    test.assert(r.ok)
+    test.assert_eq(r.opcode, tftpwire.TFTP_OP_RRQ)
+    test.assert_eq(r.file_off, 2)
+    test.assert_eq(r.file_len, 5)
+    test.assert_eq(r.mode, tftpwire.TFTP_MODE_OCTET)
+    test.assert_eq(r.options.blksize, tftpwire.TFTP_OPT_NONE)
+    test.assert(tftpwire.file_is(var p, r, "a.bin"))
+    test.assert(not tftpwire.file_is(var p, r, "a.bi"))
+    test.assert(not tftpwire.file_is(var p, r, "a.bio"))
+    test.assert(not tftpwire.file_is(var p, r, "A.bin"))
+
+    test.case("the mode and the option names ignore case")
+    test.assert(tftpwire.build_request(var p, tftpwire.TFTP_OP_WRQ, "f", "NetAscii", 1024, 9, 5))
+    let w = tftpwire.parse_request(var p)
+    test.assert(w.ok)
+    test.assert_eq(w.opcode, tftpwire.TFTP_OP_WRQ)
+    test.assert_eq(w.mode, tftpwire.TFTP_MODE_NETASCII)
+    test.assert_eq(w.options.blksize, 1024)
+    test.assert_eq(w.options.timeout, 9)
+    test.assert_eq(w.options.tsize, 5)
+    // "BLKSIZE" 42 4C 4B 53 49 5A 45, "1432".
+    var up = packet_of([0x00, 0x01, 0x61, 0x00, 0x4D, 0x41, 0x49, 0x4C, 0x00,
+                        0x42, 0x4C, 0x4B, 0x53, 0x49, 0x5A, 0x45, 0x00,
+                        0x31, 0x34, 0x33, 0x32, 0x00])
+    let u = tftpwire.parse_request(var up)
+    test.assert(u.ok)
+    test.assert_eq(u.mode, tftpwire.TFTP_MODE_MAIL)
+    test.assert_eq(u.options.blksize, 1432)
+
+    test.case("a mode that is not one of the three is carried as unknown")
+    test.assert(tftpwire.build_request(var p, tftpwire.TFTP_OP_RRQ, "f", "binary", -1, -1, -1))
+    let m = tftpwire.parse_request(var p)
+    test.assert(m.ok)
+    test.assert_eq(m.mode, tftpwire.TFTP_MODE_UNKNOWN)
+
+    test.case("a mode that is a prefix of a name is unknown too")
+    test.assert(tftpwire.build_request(var p, tftpwire.TFTP_OP_RRQ, "f", "octe", -1, -1, -1))
+    test.assert_eq(tftpwire.parse_request(var p).mode, tftpwire.TFTP_MODE_UNKNOWN)
+
+@test
+fn test_options_are_skipped_or_taken_by_the_rule_of_the_rfc() [io]
+    test.case("an option this package does not know is skipped")
+    // "windowsize" 77 69 6E 64 6F 77 73 69 7A 65, "4" 34, then "tsize" "9".
+    var p = packet_of([0x00, 0x01, 0x61, 0x00, 0x6F, 0x63, 0x74, 0x65, 0x74, 0x00,
+                       0x77, 0x69, 0x6E, 0x64, 0x6F, 0x77, 0x73, 0x69, 0x7A, 0x65, 0x00, 0x34, 0x00,
+                       0x74, 0x73, 0x69, 0x7A, 0x65, 0x00, 0x39, 0x00])
+    let r = tftpwire.parse_request(var p)
+    test.assert(r.ok)
+    test.assert_eq(r.options.tsize, 9)
+    test.assert_eq(r.options.blksize, tftpwire.TFTP_OPT_NONE)
+
+    test.case("a known option with a value out of range is skipped")
+    // blksize "7", then "65465": both are outside 8 to 65464.
+    var low = packet_of([0x00, 0x01, 0x61, 0x00, 0x6F, 0x00,
+                         0x62, 0x6C, 0x6B, 0x73, 0x69, 0x7A, 0x65, 0x00, 0x37, 0x00])
+    test.assert_eq(tftpwire.parse_request(var low).options.blksize, tftpwire.TFTP_OPT_NONE)
+    var high = packet_of([0x00, 0x01, 0x61, 0x00, 0x6F, 0x00,
+                          0x62, 0x6C, 0x6B, 0x73, 0x69, 0x7A, 0x65, 0x00,
+                          0x36, 0x35, 0x34, 0x36, 0x35, 0x00])
+    test.assert_eq(tftpwire.parse_request(var high).options.blksize, tftpwire.TFTP_OPT_NONE)
+    test.assert(tftpwire.parse_request(var high).ok)
+
+    test.case("a timeout of 0 or 256 is skipped")
+    // timeout "0" and "256".
+    var t0 = packet_of([0x00, 0x01, 0x61, 0x00, 0x6F, 0x00,
+                        0x74, 0x69, 0x6D, 0x65, 0x6F, 0x75, 0x74, 0x00, 0x30, 0x00])
+    test.assert_eq(tftpwire.parse_request(var t0).options.timeout, tftpwire.TFTP_OPT_NONE)
+    var t256 = packet_of([0x00, 0x01, 0x61, 0x00, 0x6F, 0x00,
+                          0x74, 0x69, 0x6D, 0x65, 0x6F, 0x75, 0x74, 0x00, 0x32, 0x35, 0x36, 0x00])
+    test.assert_eq(tftpwire.parse_request(var t256).options.timeout, tftpwire.TFTP_OPT_NONE)
+
+    test.case("a value that is not a number is skipped")
+    // blksize "1x".
+    var bad = packet_of([0x00, 0x01, 0x61, 0x00, 0x6F, 0x00,
+                         0x62, 0x6C, 0x6B, 0x73, 0x69, 0x7A, 0x65, 0x00, 0x31, 0x78, 0x00])
+    let b = tftpwire.parse_request(var bad)
+    test.assert(b.ok)
+    test.assert_eq(b.options.blksize, tftpwire.TFTP_OPT_NONE)
+
+    test.case("an empty value, and a value of thirteen digits, are skipped")
+    // tsize "" and then tsize "1000000000000".
+    var empty = packet_of([0x00, 0x01, 0x61, 0x00, 0x6F, 0x00,
+                           0x74, 0x73, 0x69, 0x7A, 0x65, 0x00, 0x00])
+    test.assert_eq(tftpwire.parse_request(var empty).options.tsize, tftpwire.TFTP_OPT_NONE)
+    var wide = packet_of([0x00, 0x01, 0x61, 0x00, 0x6F, 0x00,
+                          0x74, 0x73, 0x69, 0x7A, 0x65, 0x00,
+                          0x31, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x00])
+    test.assert_eq(tftpwire.parse_request(var wide).options.tsize, tftpwire.TFTP_OPT_NONE)
+
+    test.case("an option name that is a prefix of a known one is not that option")
+    // "blksiz" 62 6C 6B 73 69 7A, value "9".
+    var pre = packet_of([0x00, 0x01, 0x61, 0x00, 0x6F, 0x00,
+                         0x62, 0x6C, 0x6B, 0x73, 0x69, 0x7A, 0x00, 0x39, 0x00])
+    test.assert_eq(tftpwire.parse_request(var pre).options.blksize, tftpwire.TFTP_OPT_NONE)
+
+    test.case("the last of two equal options wins")
+    // tsize "1" then tsize "2".
+    var twice = packet_of([0x00, 0x01, 0x61, 0x00, 0x6F, 0x00,
+                           0x74, 0x73, 0x69, 0x7A, 0x65, 0x00, 0x31, 0x00,
+                           0x74, 0x73, 0x69, 0x7A, 0x65, 0x00, 0x32, 0x00])
+    test.assert_eq(tftpwire.parse_request(var twice).options.tsize, 2)
+
+@test
+fn test_a_request_that_is_not_one_is_not_ok() [io]
+    test.case("a packet of another kind")
+    var ack = packet_of([0x00, 0x04, 0x00, 0x01])
+    test.assert(not tftpwire.parse_request(var ack).ok)
+
+    test.case("an empty filename")
+    var noname = packet_of([0x00, 0x01, 0x00, 0x6F, 0x00])
+    test.assert(not tftpwire.parse_request(var noname).ok)
+
+    test.case("a filename with no zero")
+    var nozero = packet_of([0x00, 0x01, 0x61, 0x62])
+    test.assert(not tftpwire.parse_request(var nozero).ok)
+
+    test.case("a mode with no zero")
+    var nomode = packet_of([0x00, 0x01, 0x61, 0x00, 0x6F, 0x63])
+    test.assert(not tftpwire.parse_request(var nomode).ok)
+
+    test.case("an option name with no zero, and one with no value")
+    var noterm = packet_of([0x00, 0x01, 0x61, 0x00, 0x6F, 0x00, 0x74, 0x73])
+    test.assert(not tftpwire.parse_request(var noterm).ok)
+    var noval = packet_of([0x00, 0x01, 0x61, 0x00, 0x6F, 0x00, 0x74, 0x73, 0x00])
+    test.assert(not tftpwire.parse_request(var noval).ok)
+    var openval = packet_of([0x00, 0x01, 0x61, 0x00, 0x6F, 0x00, 0x74, 0x73, 0x00, 0x31])
+    test.assert(not tftpwire.parse_request(var openval).ok)
+
+    test.case("the empty packet and the one-byte packet")
+    var none = packet_of([])
+    test.assert(not tftpwire.parse_request(var none).ok)
+    var one = packet_of([0x00])
+    test.assert(not tftpwire.parse_request(var one).ok)
+
+@test
+fn test_classify_checks_the_shape_each_opcode_promises() [io]
+    test.case("the opcode alone")
+    var none = packet_of([])
+    test.assert_eq(tftpwire.opcode(var none), -1)
+    var one = packet_of([0x00])
+    test.assert_eq(tftpwire.opcode(var one), -1)
+    var zero = packet_of([0x00, 0x00, 0x00, 0x00])
+    test.assert_eq(tftpwire.opcode(var zero), -1)
+    var seven = packet_of([0x00, 0x07, 0x00, 0x00])
+    test.assert_eq(tftpwire.opcode(var seven), -1)
+    var high = packet_of([0x01, 0x04, 0x00, 0x00])
+    test.assert_eq(tftpwire.opcode(var high), -1)
+    var ack = packet_of([0x00, 0x04, 0x00, 0x02])
+    test.assert_eq(tftpwire.opcode(var ack), 4)
+
+    test.case("a request")
+    var p: tftpwire.TftpPacket = Vec.new()
+    test.assert(tftpwire.build_request(var p, tftpwire.TFTP_OP_RRQ, "a", "octet", -1, -1, -1))
+    test.assert_eq(tftpwire.classify(var p), 1)
+    test.assert(tftpwire.build_request(var p, tftpwire.TFTP_OP_WRQ, "a", "octet", -1, -1, -1))
+    test.assert_eq(tftpwire.classify(var p), 2)
+    var broken = packet_of([0x00, 0x01, 0x61])
+    test.assert_eq(tftpwire.classify(var broken), -1)
+
+    test.case("DATA is four bytes or more")
+    var d3 = packet_of([0x00, 0x03, 0x00])
+    test.assert_eq(tftpwire.classify(var d3), -1)
+    var d4 = packet_of([0x00, 0x03, 0x00, 0x01])
+    test.assert_eq(tftpwire.classify(var d4), 3)
+    var d5 = packet_of([0x00, 0x03, 0x00, 0x01, 0x55])
+    test.assert_eq(tftpwire.classify(var d5), 3)
+
+    test.case("an ACK is exactly four")
+    var a3 = packet_of([0x00, 0x04, 0x00])
+    test.assert_eq(tftpwire.classify(var a3), -1)
+    test.assert_eq(tftpwire.classify(var ack), 4)
+    var a5 = packet_of([0x00, 0x04, 0x00, 0x01, 0x00])
+    test.assert_eq(tftpwire.classify(var a5), -1)
+
+    test.case("an ERROR ends in a zero and has a code")
+    test.assert(tftpwire.build_error(var p, 2, "no"))
+    test.assert_eq(tftpwire.classify(var p), 5)
+    test.assert_eq(tftpwire.error_code(var p), 2)
+    var e4 = packet_of([0x00, 0x05, 0x00, 0x01])
+    test.assert_eq(tftpwire.classify(var e4), -1)
+    var eopen = packet_of([0x00, 0x05, 0x00, 0x01, 0x41])
+    test.assert_eq(tftpwire.classify(var eopen), -1)
+    var eempty = packet_of([0x00, 0x05, 0x00, 0x01, 0x00])
+    test.assert_eq(tftpwire.classify(var eempty), 5)
+
+    test.case("an OACK holds well-formed options, at least one")
+    test.assert(tftpwire.build_oack(var p, 8, -1, -1))
+    test.assert_eq(tftpwire.classify(var p), 6)
+    var o2 = packet_of([0x00, 0x06])
+    test.assert_eq(tftpwire.classify(var o2), -1)
+    var obad = packet_of([0x00, 0x06, 0x74, 0x73, 0x00])
+    test.assert_eq(tftpwire.classify(var obad), -1)
+
+@test
+fn test_the_fields_of_a_packet() [io]
+    var d = packet_of([0x00, 0x03, 0x12, 0x34, 0xAA, 0xBB, 0xCC])
+    test.assert_eq(tftpwire.block_of(var d), 0x1234)
+    test.assert_eq(tftpwire.data_len(var d), 3)
+    var short = packet_of([0x00, 0x03, 0x12])
+    test.assert_eq(tftpwire.block_of(var short), -1)
+    test.assert_eq(tftpwire.data_len(var short), -1)
+    test.assert_eq(tftpwire.error_code(var short), -1)
+    var e = packet_of([0x00, 0x05, 0x00, 0x08, 0x00])
+    test.assert_eq(tftpwire.error_code(var e), 8)
+
+@test
+fn test_every_error_code_has_its_rfc_text() [io]
+    test.case("the nine codes")
+    test.assert_eq(tftpwire.error_text(0), "Not defined")
+    test.assert_eq(tftpwire.error_text(1), "File not found")
+    test.assert_eq(tftpwire.error_text(2), "Access violation")
+    test.assert_eq(tftpwire.error_text(3), "Disk full or allocation exceeded")
+    test.assert_eq(tftpwire.error_text(4), "Illegal TFTP operation")
+    test.assert_eq(tftpwire.error_text(5), "Unknown transfer ID")
+    test.assert_eq(tftpwire.error_text(6), "File already exists")
+    test.assert_eq(tftpwire.error_text(7), "No such user")
+    test.assert_eq(tftpwire.error_text(8), "Option negotiation refused")
+    test.case("a code outside the table")
+    test.assert_eq(tftpwire.error_text(99), "Not defined")
+    test.assert_eq(tftpwire.error_text(-1), "Not defined")
+    test.case("the constants are the RFC's numbers")
+    test.assert_eq(tftpwire.TFTP_ERR_UNDEFINED, 0)
+    test.assert_eq(tftpwire.TFTP_ERR_FILE_NOT_FOUND, 1)
+    test.assert_eq(tftpwire.TFTP_ERR_ACCESS_VIOLATION, 2)
+    test.assert_eq(tftpwire.TFTP_ERR_DISK_FULL, 3)
+    test.assert_eq(tftpwire.TFTP_ERR_ILLEGAL_OPERATION, 4)
+    test.assert_eq(tftpwire.TFTP_ERR_UNKNOWN_TID, 5)
+    test.assert_eq(tftpwire.TFTP_ERR_FILE_EXISTS, 6)
+    test.assert_eq(tftpwire.TFTP_ERR_NO_SUCH_USER, 7)
+    test.assert_eq(tftpwire.TFTP_ERR_OPTION_REFUSED, 8)
+    test.assert_eq(tftpwire.TFTP_PORT, 69)

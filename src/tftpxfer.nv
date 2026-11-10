@@ -1,0 +1,681 @@
+// tftpxfer.nv — one TFTP transfer, as a step a caller drives, with no
+// allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  A transfer is a
+// `@value` the caller holds in a `var`, and every function here takes it
+// as `var` and answers what to do next.  The package has no socket and no
+// clock: the caller moves the datagrams and says how many milliseconds
+// have passed.  That makes a transfer replayable from a log, and it is
+// what lets a test run a whole exchange between two transfers in one
+// function, with no network and no wait.
+//
+// THE CALLER'S LOOP is four lines:
+//
+//   1. `start` answers the first thing to send.
+//   2. Whenever a datagram arrives from the peer, `on_packet` answers
+//      what to do about it.
+//   3. Whenever time passes with nothing arriving, `tick` says how many
+//      milliseconds, and answers whether to send the last packet again.
+//   4. Each answer is a `TftpStep`.  Its `action` says which packet to
+//      send, `compose` builds that packet, and the caller sends it.
+//
+// Two answers need more than a packet.  A step with `deliver` set means
+// the DATA packet that just arrived holds `len` new bytes of the file, at
+// index 4 of the packet, and the caller must take them before it reads
+// the next datagram.  A step whose action is `TFTP_ACT_DATA` means the
+// caller reads block `block` of the file, appends it to the packet
+// `compose` started, and tells `data_sent` how many bytes it appended.
+// The transfer does not hold a copy of the data, so a retransmission is
+// the same step again and the caller reads the same block again.
+//
+// WHAT THE TRANSFER KNOWS, from RFC 1350.  A transfer is lock-step: one
+// DATA or one ACK is in flight, and the next goes out when the answer
+// arrives.  A block shorter than the block size is the last.  A file
+// whose size is an exact multiple of the block size ends with a block of
+// no bytes.  Block numbers are two bytes and wrap from 65535 to 0, which
+// is what implementations do for a file larger than 65535 blocks.  The
+// sender does not answer a repeated ACK, so a late acknowledgement does
+// not start a second stream of DATA (the "sorcerer's apprentice" of RFC
+// 1123).  The receiver answers a repeated DATA with the same ACK again,
+// including after the transfer is done, which is how a lost final ACK is
+// recovered.  An ERROR from the peer ends the transfer; so does a packet
+// that has no place in the exchange, with an ERROR to the peer.
+//
+// WHAT THE TRANSFER DOES NOT KNOW is the peer's address and port.  RFC
+// 1350 identifies a transfer by the two ports, the transfer identifiers.
+// The client sends its request to the server's well-known port and takes
+// the port of the first answer as the server's transfer identifier; a
+// datagram from any other port is not part of the transfer, and the RFC
+// asks for an ERROR 5 back to its sender without ending the transfer.
+// That check is the caller's, because only the caller sees ports.  So is
+// the one for a request sent again: a client that hears nothing repeats
+// its RRQ or WRQ to the well-known port, where the server's listener
+// sees the client's address and port and must not start a second
+// transfer.  A request handed to a running transfer is an illegal
+// operation, and ends it.
+//
+// OPTIONS, from RFC 2347, 2348 and 2349.  A client asks for `blksize`,
+// `timeout` and `tsize` in its request; a server that understands any of
+// them answers with an OACK holding the ones it accepts, and a server
+// that understands none answers as if there were no options.  Either way
+// the transfer continues at the default block size of 512 bytes unless
+// the OACK says otherwise.  An OACK that offers more than was asked, a
+// larger block size, a different timeout, or an option that was not
+// requested at all, is refused with ERROR 8.
+
+use tftpwire
+
+// No packet to send: the caller waits.
+pub const TFTP_ACT_NONE = 0
+// Send the request: `compose_request` builds it.
+pub const TFTP_ACT_REQUEST = 1
+// Send an ACK of `block`.
+pub const TFTP_ACT_ACK = 2
+// Send DATA block `block`: `compose` starts the packet and the caller
+// appends the file's bytes.
+pub const TFTP_ACT_DATA = 3
+// Send the OACK that answers the request.
+pub const TFTP_ACT_OACK = 4
+// Send an ERROR with the step's `code`.
+pub const TFTP_ACT_ERROR = 5
+
+// The transfer has not been started.
+pub const TFTP_PHASE_START = 0
+// The request has gone out and the options, if any, are not settled.
+pub const TFTP_PHASE_OPEN = 1
+// The blocks are moving.
+pub const TFTP_PHASE_DATA = 2
+// The last block has been moved and acknowledged.
+pub const TFTP_PHASE_DONE = 3
+// The transfer has ended without moving the whole file.
+pub const TFTP_PHASE_FAILED = 4
+
+// A transfer that has not failed has this reason: 0.
+pub const TFTP_FAIL_NONE = 0
+// The peer sent an ERROR; `code` is its code.
+pub const TFTP_FAIL_PEER = 1
+// No answer came after the last retransmission.
+pub const TFTP_FAIL_TIMEOUT = 2
+// This end refused: it sent, or is to send, an ERROR with `code`.
+pub const TFTP_FAIL_LOCAL = 3
+
+// How long to wait for an answer before sending again, in milliseconds,
+// when no `timeout` option has been agreed: 5000.
+pub const TFTP_TIMEOUT_DEFAULT_MS = 5000
+// How many times a packet is sent again before the transfer gives up: 5.
+pub const TFTP_RETRIES_DEFAULT = 5
+
+// One transfer: its role, its place in the exchange, what was agreed and
+// the timer.
+//
+// The fields are readable and are not for writing; the functions of this
+// module are the only writers.
+pub @value
+struct TftpXfer
+    // Whether this end sent the request.
+    client: Bool
+    // Whether this end is the one sending DATA.
+    sending: Bool
+    // One of the `TFTP_PHASE_` values.
+    phase: Int
+    // For a sender, the block in flight; for a receiver, the last block
+    // acknowledged.  Block 0 is the request or the OACK.
+    block: Int
+    // The block size in force, in bytes.
+    blksize: Int
+    // The wait before a retransmission, in milliseconds.
+    timeout_ms: Int
+    // The size of the file in bytes, or `TFTP_OPT_NONE` when it is not
+    // known.
+    tsize: Int
+    // The `blksize` the client asked for, or `TFTP_OPT_NONE`.
+    want_blksize: Int
+    // The `timeout` in seconds the client asked for, or `TFTP_OPT_NONE`.
+    want_timeout: Int
+    // The `tsize` the client asked for or stated, or `TFTP_OPT_NONE`.
+    want_tsize: Int
+    // The `blksize` a server puts in its OACK, or `TFTP_OPT_NONE`.
+    oack_blksize: Int
+    // The `timeout` a server puts in its OACK, or `TFTP_OPT_NONE`.
+    oack_timeout: Int
+    // The `tsize` a server puts in its OACK, or `TFTP_OPT_NONE`.
+    oack_tsize: Int
+    // How many times the last packet has been sent again.
+    retries: Int
+    // How many times it is sent again before the transfer gives up.
+    max_retries: Int
+    // Milliseconds since the last packet was sent.
+    waited: Int
+    // The action of the last packet sent, which a timeout repeats.
+    last_act: Int
+    // The block number of that packet.
+    last_block: Int
+    // Whether the DATA in flight is the last block.
+    last_data: Bool
+    // One of the `TFTP_FAIL_` values.
+    reason: Int
+    // The TFTP error code that goes with `reason`.
+    code: Int
+
+// What to do next.
+pub @value
+struct TftpStep
+    // One of the `TFTP_ACT_` values.
+    action: Int
+    // The block number for an ACK or a DATA.
+    block: Int
+    // The error code for an ERROR.
+    code: Int
+    // Whether the DATA packet just read holds file bytes to take.
+    deliver: Bool
+    // How many bytes it holds, at index 4 of the packet.
+    len: Int
+    // Whether the transfer has just moved the whole file.
+    done: Bool
+    // Whether the transfer has just ended without moving it.
+    failed: Bool
+
+// A step that sends nothing and ends nothing.
+@tier(embedded)
+@no_alloc
+fn quiet() -> TftpStep []
+    TftpStep { action: TFTP_ACT_NONE, block: 0, code: 0, deliver: false, len: 0,
+               done: false, failed: false }
+
+// A step that sends `action` for `block` and records it as the packet a
+// timeout repeats, with the timer back at zero.
+@tier(embedded)
+@no_alloc
+fn send(var x: TftpXfer, action: Int, block: Int) -> TftpStep []
+    x.last_act = action
+    x.last_block = block
+    x.waited = 0
+    TftpStep { action: action, block: block, code: 0, deliver: false, len: 0,
+               done: false, failed: false }
+
+// The block number after `b`: one more, and 0 after 65535.
+@tier(embedded)
+@no_alloc
+fn next_block(b: Int) -> Int []
+    (b + 1) & 0xFFFF
+
+// End the transfer with an ERROR from this end.
+@tier(embedded)
+@no_alloc
+fn refuse(var x: TftpXfer, code: Int) -> TftpStep []
+    x.phase = TFTP_PHASE_FAILED
+    x.reason = TFTP_FAIL_LOCAL
+    x.code = code
+    TftpStep { action: TFTP_ACT_ERROR, block: 0, code: code, deliver: false, len: 0,
+               done: false, failed: true }
+
+// End the transfer because the peer sent an ERROR.
+@tier(embedded)
+@no_alloc
+fn peer_failed(var x: TftpXfer, code: Int) -> TftpStep []
+    x.phase = TFTP_PHASE_FAILED
+    x.reason = TFTP_FAIL_PEER
+    x.code = code
+    TftpStep { action: TFTP_ACT_NONE, block: 0, code: code, deliver: false, len: 0,
+               done: false, failed: true }
+
+// A transfer with every field set.
+@tier(embedded)
+@no_alloc
+fn make(client: Bool, sending: Bool, want_blksize: Int, want_timeout: Int, want_tsize: Int,
+        oack_blksize: Int, oack_timeout: Int, oack_tsize: Int, blksize: Int, timeout_ms: Int,
+        tsize: Int, code: Int) -> TftpXfer []
+    TftpXfer { client: client, sending: sending, phase: TFTP_PHASE_START, block: 0,
+               blksize: blksize, timeout_ms: timeout_ms, tsize: tsize,
+               want_blksize: want_blksize, want_timeout: want_timeout,
+               want_tsize: want_tsize, oack_blksize: oack_blksize,
+               oack_timeout: oack_timeout, oack_tsize: oack_tsize, retries: 0,
+               max_retries: TFTP_RETRIES_DEFAULT, waited: 0, last_act: TFTP_ACT_NONE,
+               last_block: 0, last_data: false, reason: TFTP_FAIL_NONE, code: code }
+
+// `v` when it is a valid `blksize`, and `TFTP_OPT_NONE` when it is not.
+@tier(embedded)
+@no_alloc
+fn blksize_or_none(v: Int) -> Int []
+    if v >= tftpwire.TFTP_BLOCK_MIN and v <= tftpwire.TFTP_BLOCK_LIMIT
+        return v
+    tftpwire.TFTP_OPT_NONE
+
+// `v` when it is a valid `timeout`, and `TFTP_OPT_NONE` when it is not.
+@tier(embedded)
+@no_alloc
+fn timeout_or_none(v: Int) -> Int []
+    if v >= tftpwire.TFTP_TIMEOUT_MIN and v <= tftpwire.TFTP_TIMEOUT_MAX
+        return v
+    tftpwire.TFTP_OPT_NONE
+
+// `v` when it is a valid `tsize`, and `TFTP_OPT_NONE` when it is not.
+@tier(embedded)
+@no_alloc
+fn tsize_or_none(v: Int) -> Int []
+    if v >= 0 and v <= tftpwire.TFTP_TSIZE_MAX
+        return v
+    tftpwire.TFTP_OPT_NONE
+
+// The wait in milliseconds for a `timeout` option in seconds, or the
+// default when there is none.
+@tier(embedded)
+@no_alloc
+fn wait_for(timeout: Int) -> Int []
+    if timeout == tftpwire.TFTP_OPT_NONE
+        return TFTP_TIMEOUT_DEFAULT_MS
+    timeout * 1000
+
+// A client that reads a file.
+//
+// `blksize`, `timeout` (seconds) and `tsize` are the options to ask for;
+// an option that is negative or outside its range is not asked for.  A
+// client that wants to know the size of the file asks with `tsize` 0.
+// The transfer begins at 512-byte blocks and changes only if the server's
+// OACK agrees to more.  `compose_request` builds the RRQ.
+//
+// ```novo
+// use tftpxfer
+//
+// fn main() [io]
+//     var x = tftpxfer.client_read(1024, -1, 0)
+//     let s = tftpxfer.start(var x)
+//     println("${s.action}")   // 1, send the request
+// ```
+pub @tier(embedded)
+@no_alloc
+fn client_read(blksize: Int, timeout: Int, tsize: Int) -> TftpXfer []
+    let t = timeout_or_none(timeout)
+    make(true, false, blksize_or_none(blksize), t, tsize_or_none(tsize),
+         tftpwire.TFTP_OPT_NONE, tftpwire.TFTP_OPT_NONE, tftpwire.TFTP_OPT_NONE,
+         tftpwire.TFTP_BLOCK_DEFAULT, wait_for(t), tftpwire.TFTP_OPT_NONE, 0)
+
+// A client that writes a file.
+//
+// `tsize` is the size of the file in bytes when the client states it, and
+// a negative number when it does not.  The other arguments are those of
+// `client_read`.  `compose_request` builds the WRQ.
+//
+// ```novo
+// use tftpxfer
+//
+// fn main() [io]
+//     var x = tftpxfer.client_write(-1, -1, 70000)
+//     let s = tftpxfer.start(var x)
+//     println("${s.action}")   // 1, send the request
+// ```
+pub @tier(embedded)
+@no_alloc
+fn client_write(blksize: Int, timeout: Int, tsize: Int) -> TftpXfer []
+    let t = timeout_or_none(timeout)
+    make(true, true, blksize_or_none(blksize), t, tsize_or_none(tsize),
+         tftpwire.TFTP_OPT_NONE, tftpwire.TFTP_OPT_NONE, tftpwire.TFTP_OPT_NONE,
+         tftpwire.TFTP_BLOCK_DEFAULT, wait_for(t), tftpwire.TFTP_OPT_NONE, 0)
+
+// The block size a server agrees to: what the client asked for, held to
+// the server's own limit and to `TFTP_BLOCK_MAX`.
+@tier(embedded)
+@no_alloc
+fn agreed_blksize(asked: Int, limit: Int) -> Int []
+    var top = tftpwire.TFTP_BLOCK_MAX
+    if limit >= tftpwire.TFTP_BLOCK_MIN and limit < top
+        top = limit
+    if asked > top
+        return top
+    asked
+
+// A server's transfer for a request it has read.
+//
+// `max_blksize` is the largest block the server will use, held to 1024
+// whatever is passed.  `size` is, for a read, the size of the file in
+// bytes, and, for a write, the largest file the server has room for; a
+// negative number means the server does not say, or has no limit.
+//
+// The options the request carried are answered as RFC 2347 asks: a
+// `blksize` is answered with the smaller of the request and the
+// server's limit, a `timeout` with the same number, and a `tsize` with
+// the file's size for a read and the client's own number for a write.
+// Options the server does not know were skipped when the request was
+// read.  A request that did not parse, or a write larger than `size`, ends
+// at once: `start` answers the ERROR.
+//
+// ```novo
+// use tftpxfer
+// use tftpwire
+//
+// fn main() [io]
+//     var p: tftpwire.TftpPacket = Vec.new()
+//     let _ = tftpwire.build_request(var p, tftpwire.TFTP_OP_RRQ, "fw.bin", "octet", 1024, -1, 0)
+//     var x = tftpxfer.server(tftpwire.parse_request(var p), 512, 70000)
+//     let s = tftpxfer.start(var x)
+//     println("${s.action} ${tftpxfer.block_size(x)}")   // 4 512
+// ```
+pub @tier(embedded)
+@no_alloc
+fn server(req: TftpRequest, max_blksize: Int, size: Int) -> TftpXfer []
+    if not req.ok
+        return make(false, false, -1, -1, -1, -1, -1, -1, tftpwire.TFTP_BLOCK_DEFAULT,
+                    TFTP_TIMEOUT_DEFAULT_MS, -1, tftpwire.TFTP_ERR_ILLEGAL_OPERATION)
+    let sending = req.opcode == tftpwire.TFTP_OP_RRQ
+    let o = req.options
+    var refusal = 0
+    if not sending and size >= 0 and o.tsize > size
+        refusal = tftpwire.TFTP_ERR_DISK_FULL
+    var blk = tftpwire.TFTP_OPT_NONE
+    if o.blksize != tftpwire.TFTP_OPT_NONE
+        blk = agreed_blksize(o.blksize, max_blksize)
+    var total = tftpwire.TFTP_OPT_NONE
+    if o.tsize != tftpwire.TFTP_OPT_NONE
+        if sending
+            total = size
+        else
+            total = o.tsize
+    var effective = tftpwire.TFTP_BLOCK_DEFAULT
+    if blk != tftpwire.TFTP_OPT_NONE
+        effective = blk
+    make(false, sending, -1, -1, -1, blk, o.timeout, total, effective, wait_for(o.timeout),
+         total, refusal)
+
+// Change how long a transfer waits and how often it repeats itself.
+//
+// `timeout_ms` is the wait before each retransmission, `retries` the
+// number of retransmissions before the transfer fails.  Call it before
+// `start`; a `timeout` option the peer agrees to replaces the wait.
+// A value below 1 is left as it was.
+//
+// ```novo
+// use tftpxfer
+//
+// fn main() [io]
+//     var x = tftpxfer.client_read(-1, -1, -1)
+//     tftpxfer.set_limits(var x, 200, 3)
+//     println("${x.timeout_ms} ${x.max_retries}")   // 200 3
+// ```
+pub @tier(embedded)
+@no_alloc
+fn set_limits(var x: TftpXfer, timeout_ms: Int, retries: Int) []
+    if timeout_ms >= 1
+        x.timeout_ms = timeout_ms
+    if retries >= 1
+        x.max_retries = retries
+
+// Begin the transfer and answer the first packet to send.
+//
+// A client's first packet is the request.  A server's is the OACK when
+// the request's options were accepted; otherwise the first DATA for a
+// read, and ACK 0 for a write.  A server whose transfer was refused at
+// `server` answers the ERROR.  Calling it again does nothing.
+pub @tier(embedded)
+@no_alloc
+fn start(var x: TftpXfer) -> TftpStep []
+    if x.phase != TFTP_PHASE_START
+        return quiet()
+    if x.code != 0
+        return refuse(var x, x.code)
+    x.phase = TFTP_PHASE_OPEN
+    if x.client
+        return send(var x, TFTP_ACT_REQUEST, 0)
+    if x.oack_blksize != tftpwire.TFTP_OPT_NONE or x.oack_timeout != tftpwire.TFTP_OPT_NONE
+            or x.oack_tsize != tftpwire.TFTP_OPT_NONE
+        return send(var x, TFTP_ACT_OACK, 0)
+    x.phase = TFTP_PHASE_DATA
+    if x.sending
+        x.block = 1
+        return send(var x, TFTP_ACT_DATA, 1)
+    send(var x, TFTP_ACT_ACK, 0)
+
+// Tell the transfer how many file bytes went into the DATA packet it
+// asked for.
+//
+// A count below the block size marks the block as the last, so the
+// transfer is done when the peer acknowledges it.  Call it after every
+// DATA packet, including one sent again; the answer is the same.  Bytes
+// above the block size are the caller's mistake and make the block count
+// as full.
+pub @tier(embedded)
+@no_alloc
+fn data_sent(var x: TftpXfer, len: Int) []
+    x.last_data = len < x.blksize
+
+// Settle the options a client was offered.
+//
+// Answers false when the OACK holds nothing this client asked for, or
+// asks for more than it did: a larger block size, a different timeout,
+// an option it did not request.  Otherwise the agreed values are taken
+// into the transfer.
+@tier(embedded)
+@no_alloc
+fn take_oack(var x: TftpXfer, o: TftpOptions) -> Bool []
+    let none = tftpwire.TFTP_OPT_NONE
+    if o.blksize == none and o.timeout == none and o.tsize == none
+        return false
+    if o.blksize != none and (x.want_blksize == none or o.blksize > x.want_blksize)
+        return false
+    if o.timeout != none and o.timeout != x.want_timeout
+        return false
+    if o.tsize != none and x.want_tsize == none
+        return false
+    if o.blksize != none
+        x.blksize = o.blksize
+    if o.timeout != none
+        x.timeout_ms = o.timeout * 1000
+    if o.tsize != none
+        x.tsize = o.tsize
+    true
+
+// What a client does when its OACK is acceptable: the sender goes on to
+// block 1 and the receiver acknowledges block 0.
+@tier(embedded)
+@no_alloc
+fn opened(var x: TftpXfer) -> TftpStep []
+    x.retries = 0
+    x.phase = TFTP_PHASE_DATA
+    if x.sending
+        x.block = 1
+        return send(var x, TFTP_ACT_DATA, 1)
+    x.block = 0
+    send(var x, TFTP_ACT_ACK, 0)
+
+// The sender's answer to an ACK.
+@tier(embedded)
+@no_alloc
+fn sender_acked(var x: TftpXfer, block: Int) -> TftpStep []
+    if block != x.block
+        return quiet()
+    x.retries = 0
+    if x.phase == TFTP_PHASE_OPEN
+        return opened(var x)
+    if x.last_data
+        x.phase = TFTP_PHASE_DONE
+        return TftpStep { action: TFTP_ACT_NONE, block: block, code: 0, deliver: false,
+                          len: 0, done: true, failed: false }
+    x.block = next_block(block)
+    send(var x, TFTP_ACT_DATA, x.block)
+
+// The receiver's answer to a DATA packet.
+@tier(embedded)
+@no_alloc
+fn receiver_got(var x: TftpXfer, block: Int, len: Int) -> TftpStep []
+    if block == x.block and x.phase != TFTP_PHASE_OPEN
+        // The peer did not hear the last ACK.  Say it again, and take
+        // nothing.
+        return send(var x, TFTP_ACT_ACK, block)
+    if block != next_block(x.block) or x.phase == TFTP_PHASE_DONE
+        return quiet()
+    if len > x.blksize
+        return refuse(var x, tftpwire.TFTP_ERR_ILLEGAL_OPERATION)
+    x.retries = 0
+    x.block = block
+    let last = len < x.blksize
+    if last
+        x.phase = TFTP_PHASE_DONE
+    else
+        x.phase = TFTP_PHASE_DATA
+    x.last_act = TFTP_ACT_ACK
+    x.last_block = block
+    x.waited = 0
+    TftpStep { action: TFTP_ACT_ACK, block: block, code: 0, deliver: true, len: len,
+               done: last, failed: false }
+
+// Give the transfer a datagram from the peer and answer what to do.
+//
+// `pkt` is the whole datagram.  A packet the transfer was not waiting for
+// is dropped without an answer: a repeated ACK, a DATA block from the
+// past or the future.  A packet that has no place in a transfer at all,
+// one that is not a well-formed TFTP packet or is of a kind that this end
+// never receives, ends it with ERROR 4.  An ERROR packet ends it with the
+// peer's code in the step.  A datagram given to a transfer that is not
+// started, is done or has failed is dropped, except that a receiver that
+// is done answers the final DATA again if it arrives again.
+//
+// ```novo
+// use tftpxfer
+// use tftpwire
+//
+// fn main() [io]
+//     // A client reads a file of three bytes from a server.
+//     var x = tftpxfer.client_read(-1, -1, -1)
+//     let first = tftpxfer.start(var x)
+//     var p: tftpwire.TftpPacket = Vec.new()
+//     let _ = tftpwire.build_data(var p, 1)
+//     let _ = tftpwire.push_data(var p, 0x61)
+//     let _ = tftpwire.push_data(var p, 0x62)
+//     let _ = tftpwire.push_data(var p, 0x63)
+//     let s = tftpxfer.on_packet(var x, var p)
+//     println("${first.action} ${s.action} ${s.block} ${s.len} ${s.done}")   // 1 2 1 3 true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn on_packet(var x: TftpXfer, var pkt: TftpPacket) -> TftpStep []
+    if x.phase == TFTP_PHASE_START or x.phase == TFTP_PHASE_FAILED
+        return quiet()
+    let op = tftpwire.classify(var pkt)
+    if x.phase == TFTP_PHASE_DONE
+        if x.sending or op != tftpwire.TFTP_OP_DATA
+            return quiet()
+        return receiver_got(var x, tftpwire.block_of(var pkt), tftpwire.data_len(var pkt))
+    if op == tftpwire.TFTP_OP_ERROR
+        return peer_failed(var x, tftpwire.error_code(var pkt))
+    if op == tftpwire.TFTP_OP_ACK and x.sending
+        return sender_acked(var x, tftpwire.block_of(var pkt))
+    if op == tftpwire.TFTP_OP_DATA and not x.sending
+        return receiver_got(var x, tftpwire.block_of(var pkt), tftpwire.data_len(var pkt))
+    if op == tftpwire.TFTP_OP_OACK and x.client and x.phase == TFTP_PHASE_OPEN
+        if take_oack(var x, tftpwire.parse_options(var pkt, 2))
+            return opened(var x)
+        return refuse(var x, tftpwire.TFTP_ERR_OPTION_REFUSED)
+    refuse(var x, tftpwire.TFTP_ERR_ILLEGAL_OPERATION)
+
+// Say that `ms` milliseconds have passed since the last call, and answer
+// whether to send the last packet again.
+//
+// While the wait is not over the answer is a step that does nothing.
+// When it is over, the answer repeats the last packet's action and block,
+// and the timer starts again.  After `max_retries` repeats with no answer
+// the transfer fails with `TFTP_FAIL_TIMEOUT` and the step says so.  A
+// transfer that is not started, is done or has failed has no timer; a
+// receiver that is done does not repeat its final ACK on its own, since
+// the peer asks for it by sending the final DATA again.
+//
+// ```novo
+// use tftpxfer
+//
+// fn main() [io]
+//     var x = tftpxfer.client_read(-1, -1, -1)
+//     tftpxfer.set_limits(var x, 100, 2)
+//     let first = tftpxfer.start(var x)
+//     let a = tftpxfer.tick(var x, 60)
+//     let b = tftpxfer.tick(var x, 60)
+//     println("${first.action} ${a.action} ${b.action}")   // 1 0 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn tick(var x: TftpXfer, ms: Int) -> TftpStep []
+    if x.phase == TFTP_PHASE_START or x.phase == TFTP_PHASE_DONE or x.phase == TFTP_PHASE_FAILED
+        return quiet()
+    x.waited = x.waited + ms
+    if x.waited < x.timeout_ms
+        return quiet()
+    x.retries = x.retries + 1
+    if x.retries > x.max_retries
+        x.phase = TFTP_PHASE_FAILED
+        x.reason = TFTP_FAIL_TIMEOUT
+        return TftpStep { action: TFTP_ACT_NONE, block: 0, code: 0, deliver: false, len: 0,
+                          done: false, failed: true }
+    send(var x, x.last_act, x.last_block)
+
+// Build the packet a step asks for into `out`, replacing what it held.
+//
+// An ACK, an OACK, an ERROR, and the header of a DATA packet, to which
+// the caller appends the block's bytes.  Answers false, with `out`
+// empty, for a step that sends nothing or whose action is the request,
+// which `compose_request` builds because it needs the name of the file.
+//
+// ```novo
+// use tftpxfer
+// use tftpwire
+//
+// fn main() [io]
+//     var x = tftpxfer.client_write(-1, -1, -1)
+//     var out: tftpwire.TftpPacket = Vec.new()
+//     let s = tftpxfer.start(var x)
+//     println("${tftpxfer.compose(var x, s, var out)}")   // false, it is the request
+//     println("${tftpxfer.compose_request(var x, var out, "a.bin", "octet")} ${out.len()}")   // true 14
+// ```
+pub @tier(embedded)
+@no_alloc
+fn compose(var x: TftpXfer, s: TftpStep, var out: TftpPacket) -> Bool []
+    out.clear()
+    if s.action == TFTP_ACT_ACK
+        return tftpwire.build_ack(var out, s.block)
+    if s.action == TFTP_ACT_DATA
+        return tftpwire.build_data(var out, s.block)
+    if s.action == TFTP_ACT_OACK
+        return tftpwire.build_oack(var out, x.oack_blksize, x.oack_timeout, x.oack_tsize)
+    if s.action == TFTP_ACT_ERROR
+        return tftpwire.build_error(var out, s.code, tftpwire.error_text(s.code))
+    false
+
+// Build the request of a client into `out`: an RRQ for a client that
+// reads and a WRQ for one that writes, with the options it asked for.
+//
+// `filename` and `mode` are written as given; `mode` is `"octet"` for
+// every file that is not text.  Answers false, with `out` empty, when the
+// transfer is a server's or the request does not fit.
+pub @tier(embedded)
+@no_alloc
+fn compose_request(var x: TftpXfer, var out: TftpPacket, filename: Str, mode: Str) -> Bool []
+    out.clear()
+    if not x.client
+        return false
+    var op = tftpwire.TFTP_OP_RRQ
+    if x.sending
+        op = tftpwire.TFTP_OP_WRQ
+    tftpwire.build_request(var out, op, filename, mode, x.want_blksize, x.want_timeout,
+                           x.want_tsize)
+
+// Whether the whole file has been moved and acknowledged.
+pub @tier(embedded)
+@no_alloc
+fn is_done(x: TftpXfer) -> Bool []
+    x.phase == TFTP_PHASE_DONE
+
+// Whether the transfer has ended without moving the whole file.
+pub @tier(embedded)
+@no_alloc
+fn is_failed(x: TftpXfer) -> Bool []
+    x.phase == TFTP_PHASE_FAILED
+
+// The block size in force, in bytes: 512 until an OACK agrees otherwise.
+// A block shorter than this ends the transfer.
+pub @tier(embedded)
+@no_alloc
+fn block_size(x: TftpXfer) -> Int []
+    x.blksize
+
+// The size of the file in bytes when the peer has stated it, and
+// `TFTP_OPT_NONE` when it has not.
+pub @tier(embedded)
+@no_alloc
+fn total_size(x: TftpXfer) -> Int []
+    x.tsize

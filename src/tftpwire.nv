@@ -1,0 +1,617 @@
+// tftpwire.nv — the packets of TFTP, with no allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  A packet is
+// built into a buffer the caller owns and read in place, so a
+// bootloader, a task or a test can build and read one with no heap.
+//
+// THE FORMATS.  RFC 1350 defines five packets.  Every one starts with a
+// two-byte opcode, and every number on the wire is big-endian.
+//
+//   RRQ, WRQ   opcode 1 or 2, filename, 0, mode, 0, then options
+//   DATA       opcode 3, block number (2 bytes), 0 to blksize bytes
+//   ACK        opcode 4, block number (2 bytes)
+//   ERROR      opcode 5, error code (2 bytes), message, 0
+//   OACK       opcode 6, then options (RFC 2347)
+//
+// An option is a name, 0, a value written as decimal digits, 0.  RFC
+// 2348 defines `blksize` (8 to 65464), RFC 2349 defines `timeout` (1 to
+// 255 seconds) and `tsize` (the size of the file in bytes).  Option
+// names and the mode are compared without regard to case, as the RFCs
+// say.  An option this package does not know is skipped, which is what
+// RFC 2347 asks of a server, and so is a known option whose value is
+// outside its range or is not a number: the field stays `TFTP_OPT_NONE`.
+//
+// A BLOCK IS AT MOST `TFTP_BLOCK_MAX` BYTES here, 1024, and a packet at
+// most `TFTP_PACKET_MAX`, 1028.  The protocol allows 65464, and a
+// microcontroller that is asked for more answers with a smaller
+// `blksize` in its OACK, which RFC 2348 permits.  A packet that does not
+// fit the buffer is never built.
+//
+// NETASCII IS NOT TRANSLATED.  The mode is parsed, named and carried;
+// the bytes of a DATA packet are the caller's.  A file sent in netascii
+// mode has to be converted before it is cut into blocks.
+
+use std.str
+
+// The well-known port of a TFTP server: 69.
+pub const TFTP_PORT = 69
+
+// Opcode of a read request: 1.
+pub const TFTP_OP_RRQ = 1
+// Opcode of a write request: 2.
+pub const TFTP_OP_WRQ = 2
+// Opcode of a data packet: 3.
+pub const TFTP_OP_DATA = 3
+// Opcode of an acknowledgement: 4.
+pub const TFTP_OP_ACK = 4
+// Opcode of an error packet: 5.
+pub const TFTP_OP_ERROR = 5
+// Opcode of an option acknowledgement (RFC 2347): 6.
+pub const TFTP_OP_OACK = 6
+
+// Error code: not defined, see the message: 0.
+pub const TFTP_ERR_UNDEFINED = 0
+// Error code: file not found: 1.
+pub const TFTP_ERR_FILE_NOT_FOUND = 1
+// Error code: access violation: 2.
+pub const TFTP_ERR_ACCESS_VIOLATION = 2
+// Error code: disk full or allocation exceeded: 3.
+pub const TFTP_ERR_DISK_FULL = 3
+// Error code: illegal TFTP operation: 4.
+pub const TFTP_ERR_ILLEGAL_OPERATION = 4
+// Error code: unknown transfer ID: 5.
+pub const TFTP_ERR_UNKNOWN_TID = 5
+// Error code: file already exists: 6.
+pub const TFTP_ERR_FILE_EXISTS = 6
+// Error code: no such user: 7.
+pub const TFTP_ERR_NO_SUCH_USER = 7
+// Error code: the options were refused (RFC 2347): 8.
+pub const TFTP_ERR_OPTION_REFUSED = 8
+
+// The mode of a request was not one of the three RFC 1350 names: 0.
+pub const TFTP_MODE_UNKNOWN = 0
+// The mode `netascii`: 1.
+pub const TFTP_MODE_NETASCII = 1
+// The mode `octet`: 2.
+pub const TFTP_MODE_OCTET = 2
+// The mode `mail`, which RFC 1350 obsoletes: 3.
+pub const TFTP_MODE_MAIL = 3
+
+// An option that is absent: -1.  A request builder leaves such an
+// option out, and a parser reports an option it did not find, or one it
+// could not use, as this.
+pub const TFTP_OPT_NONE = -1
+// The block size when no `blksize` is negotiated, in bytes: 512.
+pub const TFTP_BLOCK_DEFAULT = 512
+// The smallest `blksize` RFC 2348 allows: 8.
+pub const TFTP_BLOCK_MIN = 8
+// The largest `blksize` RFC 2348 allows: 65464.
+pub const TFTP_BLOCK_LIMIT = 65464
+// The largest block this package builds and reads, in bytes: 1024.
+pub const TFTP_BLOCK_MAX = 1024
+// The largest packet, in bytes: 1028, an opcode, a block number and a
+// full block.
+pub const TFTP_PACKET_MAX = 4 + TFTP_BLOCK_MAX
+// The smallest `timeout` option RFC 2349 allows, in seconds: 1.
+pub const TFTP_TIMEOUT_MIN = 1
+// The largest `timeout` option RFC 2349 allows, in seconds: 255.
+pub const TFTP_TIMEOUT_MAX = 255
+// The largest `tsize` this package writes or accepts, in bytes: twelve
+// decimal digits, about a terabyte.
+pub const TFTP_TSIZE_MAX = 999999999999
+
+// A packet buffer: the type every function here takes and every packet
+// is built in.
+pub alias TftpPacket = Vec[u8; TFTP_PACKET_MAX]
+
+// The options of a request or of an OACK.
+//
+// Each is `TFTP_OPT_NONE` when the packet did not carry it or carried
+// it with a value out of range.  `ok` is false when the options were not
+// a run of well-formed name and value pairs.
+pub @value
+struct TftpOptions
+    // Whether the options were well formed.
+    ok: Bool
+    // The `blksize` option, 8 to 65464, or `TFTP_OPT_NONE`.
+    blksize: Int
+    // The `timeout` option in seconds, 1 to 255, or `TFTP_OPT_NONE`.
+    timeout: Int
+    // The `tsize` option in bytes, or `TFTP_OPT_NONE`.
+    tsize: Int
+
+// A parsed RRQ or WRQ.
+//
+// The filename is not copied.  `file_off` is where it starts in the
+// packet and `file_len` is its length, so the request costs a few
+// integers and the name stays where the datagram put it.
+pub @value
+struct TftpRequest
+    // Whether the packet was a well-formed request.
+    ok: Bool
+    // `TFTP_OP_RRQ` or `TFTP_OP_WRQ`.
+    opcode: Int
+    // The index of the first byte of the filename in the packet.
+    file_off: Int
+    // The length of the filename in bytes.
+    file_len: Int
+    // `TFTP_MODE_NETASCII`, `TFTP_MODE_OCTET`, `TFTP_MODE_MAIL` or
+    // `TFTP_MODE_UNKNOWN`.
+    mode: Int
+    // The options the request carried.
+    options: TftpOptions
+
+// Append one byte.
+@tier(embedded)
+@no_alloc
+fn put_u8(var out: TftpPacket, v: Int) -> Bool []
+    match out.push((v & 0xFF) as u8)
+        Ok(_)  => true
+        Err(_) => false
+
+// Append two bytes, most significant first.
+@tier(embedded)
+@no_alloc
+fn put_u16(var out: TftpPacket, v: Int) -> Bool []
+    put_u8(var out, v >>> 8) and put_u8(var out, v)
+
+// Append the bytes of a string, with no terminator.
+@tier(embedded)
+@no_alloc
+fn put_text(var out: TftpPacket, s: Str) -> Bool []
+    var ok = true
+    for i in 0..str.len(s)
+        ok = ok and put_u8(var out, str.byte_at_or(s, i, 0))
+    ok
+
+// Append a string and its terminating zero.
+@tier(embedded)
+@no_alloc
+fn put_cstr(var out: TftpPacket, s: Str) -> Bool []
+    put_text(var out, s) and put_u8(var out, 0)
+
+// Append a non-negative number as decimal digits, with no terminator.
+//
+// Twelve digits at most, which is `TFTP_TSIZE_MAX`.
+@tier(embedded)
+@no_alloc
+fn put_decimal(var out: TftpPacket, n: Int) -> Bool []
+    if n < 0 or n > TFTP_TSIZE_MAX
+        return false
+    var scale = 100000000000
+    var ok = true
+    var started = false
+    for _i in 0..12
+        let digit = n / scale % 10
+        if digit != 0 or started or scale == 1
+            started = true
+            ok = ok and put_u8(var out, 48 + digit)
+        scale = scale / 10
+    ok
+
+// Append one option, name and value each followed by a zero.  A negative
+// value is an option the caller did not ask for, and writes nothing.
+@tier(embedded)
+@no_alloc
+fn put_option(var out: TftpPacket, name: Str, value: Int) -> Bool []
+    if value < 0
+        return true
+    put_cstr(var out, name) and put_decimal(var out, value) and put_u8(var out, 0)
+
+// Empty the buffer when a builder failed, so that a half-built packet is
+// never sent.  Answers `ok`.
+@tier(embedded)
+@no_alloc
+fn seal(var out: TftpPacket, ok: Bool) -> Bool []
+    if not ok
+        out.clear()
+    ok
+
+// Build a read or write request, replacing what `out` held.
+//
+// `opcode` is `TFTP_OP_RRQ` or `TFTP_OP_WRQ`.  `filename` and `mode` are
+// written as given; `mode` is conventionally `"octet"`.  The three
+// options are written when they are not negative and left out
+// otherwise, in the order `blksize`, `timeout`, `tsize`.  A client
+// reading a file asks for the size with `tsize` 0 and the server answers
+// it; a client writing a file states it.  Answers false, with `out`
+// empty, when the opcode is not a request, an option is out of its range
+// or the packet does not fit.
+//
+// ```novo
+// use tftpwire
+//
+// fn main() [io]
+//     var p: tftpwire.TftpPacket = Vec.new()
+//     let ok = tftpwire.build_request(var p, tftpwire.TFTP_OP_RRQ, "a.bin", "octet", -1, -1, -1)
+//     println("${ok} ${p.len()}")   // true 15
+// ```
+pub @tier(embedded)
+@no_alloc
+fn build_request(var out: TftpPacket, opcode: Int, filename: Str, mode: Str, blksize: Int,
+                 timeout: Int, tsize: Int) -> Bool []
+    out.clear()
+    if opcode != TFTP_OP_RRQ and opcode != TFTP_OP_WRQ
+        return false
+    if blksize >= 0 and (blksize < TFTP_BLOCK_MIN or blksize > TFTP_BLOCK_LIMIT)
+        return false
+    if timeout >= 0 and (timeout < TFTP_TIMEOUT_MIN or timeout > TFTP_TIMEOUT_MAX)
+        return false
+    var ok = put_u16(var out, opcode) and put_cstr(var out, filename)
+    ok = ok and put_cstr(var out, mode)
+    ok = ok and put_option(var out, "blksize", blksize)
+    ok = ok and put_option(var out, "timeout", timeout)
+    ok = ok and put_option(var out, "tsize", tsize)
+    seal(var out, ok)
+
+// Build the header of a DATA packet, replacing what `out` held: the
+// opcode and the block number.
+//
+// The caller appends the block's bytes with `push_data`, or pushes them
+// onto `out` directly.
+//
+// ```novo
+// use tftpwire
+//
+// fn main() [io]
+//     var p: tftpwire.TftpPacket = Vec.new()
+//     let ok = tftpwire.build_data(var p, 1)
+//     let more = tftpwire.push_data(var p, 0x41)
+//     println("${ok} ${more} ${p.len()}")   // true true 5
+// ```
+pub @tier(embedded)
+@no_alloc
+fn build_data(var out: TftpPacket, block: Int) -> Bool []
+    out.clear()
+    put_u16(var out, TFTP_OP_DATA) and put_u16(var out, block)
+
+// Append one byte of file data to a DATA packet.  Answers false when the
+// packet is full.
+pub @tier(embedded)
+@no_alloc
+fn push_data(var out: TftpPacket, byte: Int) -> Bool []
+    put_u8(var out, byte)
+
+// Build an ACK, replacing what `out` held.
+//
+// Block 0 acknowledges a WRQ, or the OACK of a read.
+//
+// ```novo
+// use tftpwire
+//
+// fn main() [io]
+//     var p: tftpwire.TftpPacket = Vec.new()
+//     let ok = tftpwire.build_ack(var p, 7)
+//     println("${ok} ${p[3]}")   // true 7
+// ```
+pub @tier(embedded)
+@no_alloc
+fn build_ack(var out: TftpPacket, block: Int) -> Bool []
+    out.clear()
+    put_u16(var out, TFTP_OP_ACK) and put_u16(var out, block)
+
+// Build an ERROR packet, replacing what `out` held.
+//
+// `message` is written as given and followed by the zero.  Answers false,
+// with `out` empty, when it does not fit.
+pub @tier(embedded)
+@no_alloc
+fn build_error(var out: TftpPacket, code: Int, message: Str) -> Bool []
+    out.clear()
+    let ok = put_u16(var out, TFTP_OP_ERROR) and put_u16(var out, code)
+        and put_cstr(var out, message)
+    seal(var out, ok)
+
+// Build an OACK, replacing what `out` held.
+//
+// An option that is negative is left out.  A server answers a request
+// with the options it accepts and no others.  Answers false, with `out`
+// empty, when no option was given at all, because an OACK without
+// options is not a packet RFC 2347 describes.
+//
+// ```novo
+// use tftpwire
+//
+// fn main() [io]
+//     var p: tftpwire.TftpPacket = Vec.new()
+//     let ok = tftpwire.build_oack(var p, 1024, -1, 4096)
+//     println("${ok} ${p.len()}")   // true 28
+// ```
+pub @tier(embedded)
+@no_alloc
+fn build_oack(var out: TftpPacket, blksize: Int, timeout: Int, tsize: Int) -> Bool []
+    out.clear()
+    if blksize < 0 and timeout < 0 and tsize < 0
+        return false
+    var ok = put_u16(var out, TFTP_OP_OACK)
+    ok = ok and put_option(var out, "blksize", blksize)
+    ok = ok and put_option(var out, "timeout", timeout)
+    ok = ok and put_option(var out, "tsize", tsize)
+    seal(var out, ok)
+
+// The lower-case form of an ASCII letter; any other byte is unchanged.
+@tier(embedded)
+@no_alloc
+fn lower(b: Int) -> Int []
+    if b >= 65 and b <= 90
+        return b + 32
+    b
+
+// The index of the first zero byte at or after `from`, or -1.
+@tier(embedded)
+@no_alloc
+fn find_zero(var pkt: TftpPacket, from: Int) -> Int []
+    for i in from..pkt.len()
+        if pkt[i] == 0
+            return i
+    -1
+
+// Whether `len` bytes of the packet from `off` spell `name`, without
+// regard to case.
+@tier(embedded)
+@no_alloc
+fn spells(var pkt: TftpPacket, off: Int, len: Int, name: Str) -> Bool []
+    if len != str.len(name)
+        return false
+    for i in 0..len
+        if lower(pkt[off + i] as Int) != lower(str.byte_at_or(name, i, 0))
+            return false
+    true
+
+// The decimal number written in `len` bytes from `off`, or -1 when
+// there are none or one is not a digit, or when it has more than twelve
+// digits.
+@tier(embedded)
+@no_alloc
+fn decimal_at(var pkt: TftpPacket, off: Int, len: Int) -> Int []
+    if len < 1 or len > 12
+        return -1
+    var n = 0
+    for i in 0..len
+        let d = pkt[off + i] as Int - 48
+        if d < 0 or d > 9
+            return -1
+        n = n * 10 + d
+    n
+
+// Record one option pair in `o` when it names a known option with a
+// value in range.  The value is `vlen` bytes from `voff`.
+@tier(embedded)
+@no_alloc
+fn apply_option(var o: TftpOptions, var pkt: TftpPacket, noff: Int, nlen: Int, voff: Int,
+                vlen: Int) []
+    let v = decimal_at(var pkt, voff, vlen)
+    if spells(var pkt, noff, nlen, "blksize")
+        if v >= TFTP_BLOCK_MIN and v <= TFTP_BLOCK_LIMIT
+            o.blksize = v
+    else if spells(var pkt, noff, nlen, "timeout")
+        if v >= TFTP_TIMEOUT_MIN and v <= TFTP_TIMEOUT_MAX
+            o.timeout = v
+    else if spells(var pkt, noff, nlen, "tsize")
+        if v >= 0
+            o.tsize = v
+
+// Walk the option pairs from `from` to the end of the packet, recording
+// each in `o`.  A value of a `@value` struct is written through a `var`
+// parameter, which is why the walk is a function of its own.
+@tier(embedded)
+@no_alloc
+fn scan_options(var o: TftpOptions, var pkt: TftpPacket, from: Int) []
+    var pos = from
+    for _i in 0..pkt.len()
+        if o.ok and pos < pkt.len()
+            let name_end = find_zero(var pkt, pos)
+            let value_end = find_zero(var pkt, name_end + 1)
+            if name_end < 0 or value_end < 0
+                o.ok = false
+            else
+                apply_option(var o, var pkt, pos, name_end - pos, name_end + 1,
+                             value_end - name_end - 1)
+                pos = value_end + 1
+
+// Read the options that start at `from`: pairs of a name and a value,
+// each ended by a zero, up to the end of the packet.
+//
+// `ok` is false when the last name or value has no zero after it.
+// An option this package does not know is skipped.
+//
+// ```novo
+// use tftpwire
+//
+// fn main() [io]
+//     var p: tftpwire.TftpPacket = Vec.new()
+//     let _ = tftpwire.build_oack(var p, 1024, 3, -1)
+//     let o = tftpwire.parse_options(var p, 2)
+//     println("${o.ok} ${o.blksize} ${o.timeout}")   // true 1024 3
+// ```
+pub @tier(embedded)
+@no_alloc
+fn parse_options(var pkt: TftpPacket, from: Int) -> TftpOptions []
+    var o = TftpOptions { ok: true, blksize: TFTP_OPT_NONE, timeout: TFTP_OPT_NONE,
+                          tsize: TFTP_OPT_NONE }
+    scan_options(var o, var pkt, from)
+    o
+
+// The mode named by `len` bytes from `off`.
+@tier(embedded)
+@no_alloc
+fn mode_at(var pkt: TftpPacket, off: Int, len: Int) -> Int []
+    if spells(var pkt, off, len, "netascii")
+        return TFTP_MODE_NETASCII
+    if spells(var pkt, off, len, "octet")
+        return TFTP_MODE_OCTET
+    if spells(var pkt, off, len, "mail")
+        return TFTP_MODE_MAIL
+    TFTP_MODE_UNKNOWN
+
+// The request that did not parse.
+@tier(embedded)
+@no_alloc
+fn bad_request() -> TftpRequest []
+    TftpRequest { ok: false, opcode: 0, file_off: 0, file_len: 0, mode: TFTP_MODE_UNKNOWN,
+                  options: TftpOptions { ok: false, blksize: TFTP_OPT_NONE,
+                                         timeout: TFTP_OPT_NONE, tsize: TFTP_OPT_NONE } }
+
+// Read an RRQ or a WRQ.
+//
+// `ok` is false when the packet is not a request, when the filename is
+// empty, when the filename or the mode has no terminating zero, or when
+// the options are malformed.  A mode that is not one of the three names
+// is not a refusal here: it is `TFTP_MODE_UNKNOWN`, and the server
+// decides, which RFC 1350 leaves to it.
+//
+// ```novo
+// use tftpwire
+//
+// fn main() [io]
+//     var p: tftpwire.TftpPacket = Vec.new()
+//     let _ = tftpwire.build_request(var p, tftpwire.TFTP_OP_WRQ, "fw.bin", "OCTET", 512, -1, 70000)
+//     let r = tftpwire.parse_request(var p)
+//     println("${r.ok} ${r.file_len} ${r.mode} ${r.options.tsize}")   // true 6 2 70000
+// ```
+pub @tier(embedded)
+@no_alloc
+fn parse_request(var pkt: TftpPacket) -> TftpRequest []
+    let op = opcode(var pkt)
+    if op != TFTP_OP_RRQ and op != TFTP_OP_WRQ
+        return bad_request()
+    let name_end = find_zero(var pkt, 2)
+    if name_end < 3
+        return bad_request()
+    let mode_end = find_zero(var pkt, name_end + 1)
+    if mode_end < 0
+        return bad_request()
+    let options = parse_options(var pkt, mode_end + 1)
+    if not options.ok
+        return bad_request()
+    TftpRequest { ok: true, opcode: op, file_off: 2, file_len: name_end - 2,
+                  mode: mode_at(var pkt, name_end + 1, mode_end - name_end - 1),
+                  options: options }
+
+// Whether the filename of a parsed request is `name`.  The comparison is
+// exact and case-sensitive, as file names are.
+//
+// ```novo
+// use tftpwire
+//
+// fn main() [io]
+//     var p: tftpwire.TftpPacket = Vec.new()
+//     let _ = tftpwire.build_request(var p, tftpwire.TFTP_OP_RRQ, "fw.bin", "octet", -1, -1, -1)
+//     let r = tftpwire.parse_request(var p)
+//     println("${tftpwire.file_is(var p, r, "fw.bin")} ${tftpwire.file_is(var p, r, "FW.BIN")}")   // true false
+// ```
+pub @tier(embedded)
+@no_alloc
+fn file_is(var pkt: TftpPacket, req: TftpRequest, name: Str) -> Bool []
+    if req.file_len != str.len(name)
+        return false
+    for i in 0..req.file_len
+        if (pkt[req.file_off + i] as Int) != str.byte_at_or(name, i, 0)
+            return false
+    true
+
+// The opcode of a packet, 1 to 6, or -1 when the packet is too short to
+// hold one or the opcode is not one of the six.
+//
+// This reads the two bytes and nothing else; `classify` also checks the
+// shape the opcode promises.
+pub @tier(embedded)
+@no_alloc
+fn opcode(var pkt: TftpPacket) -> Int []
+    if pkt.len() < 2
+        return -1
+    let op = pkt[0] as Int * 256 + pkt[1] as Int
+    if op < TFTP_OP_RRQ or op > TFTP_OP_OACK
+        return -1
+    op
+
+// The opcode of a packet that has the shape its opcode asks for, or -1.
+//
+// A request has a filename and a mode; DATA has a block number and
+// anything after it; an ACK is exactly four bytes; an ERROR has a code and
+// ends in a zero; an OACK is a run of well-formed options with at least
+// one.  A datagram that fails this is not a TFTP packet the state machine
+// should see.
+//
+// ```novo
+// use tftpwire
+//
+// fn main() [io]
+//     var p: tftpwire.TftpPacket = Vec.new()
+//     let _ = tftpwire.build_ack(var p, 1)
+//     println("${tftpwire.classify(var p)}")   // 4
+//     let _ = p.pop()
+//     println("${tftpwire.classify(var p)}")   // -1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn classify(var pkt: TftpPacket) -> Int []
+    let op = opcode(var pkt)
+    if op == TFTP_OP_RRQ or op == TFTP_OP_WRQ
+        if parse_request(var pkt).ok
+            return op
+        return -1
+    if op == TFTP_OP_DATA
+        if pkt.len() >= 4
+            return op
+        return -1
+    if op == TFTP_OP_ACK
+        if pkt.len() == 4
+            return op
+        return -1
+    if op == TFTP_OP_ERROR
+        if pkt.len() >= 5 and pkt[pkt.len() - 1] == 0
+            return op
+        return -1
+    if op == TFTP_OP_OACK
+        if pkt.len() > 2 and parse_options(var pkt, 2).ok
+            return op
+    -1
+
+// The block number of a DATA or ACK packet, or -1 when the packet is
+// shorter than four bytes.
+pub @tier(embedded)
+@no_alloc
+fn block_of(var pkt: TftpPacket) -> Int []
+    if pkt.len() < 4
+        return -1
+    pkt[2] as Int * 256 + pkt[3] as Int
+
+// The number of file bytes in a DATA packet: its length less the four
+// bytes of header, or -1 when the packet is shorter than that.
+pub @tier(embedded)
+@no_alloc
+fn data_len(var pkt: TftpPacket) -> Int []
+    if pkt.len() < 4
+        return -1
+    pkt.len() - 4
+
+// The error code of an ERROR packet, or -1 when the packet is shorter
+// than four bytes.
+pub @tier(embedded)
+@no_alloc
+fn error_code(var pkt: TftpPacket) -> Int []
+    block_of(var pkt)
+
+// The standard text of an error code, in the words RFC 1350 uses.  A code
+// outside 0 to 8 is "Not defined".
+//
+// ```novo
+// use tftpwire
+//
+// fn main() [io]
+//     println(tftpwire.error_text(tftpwire.TFTP_ERR_FILE_NOT_FOUND))   // File not found
+// ```
+pub @tier(embedded)
+@no_alloc
+fn error_text(code: Int) -> Str []
+    match code
+        1 => "File not found"
+        2 => "Access violation"
+        3 => "Disk full or allocation exceeded"
+        4 => "Illegal TFTP operation"
+        5 => "Unknown transfer ID"
+        6 => "File already exists"
+        7 => "No such user"
+        8 => "Option negotiation refused"
+        _ => "Not defined"

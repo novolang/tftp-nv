@@ -1,0 +1,233 @@
+// tftp_loop_tests.nv — two transfers against each other.
+//
+// A client and a server exchange datagrams through a function that is
+// the network: it loses the packets whose position in the sequence of
+// everything sent is on a list, and when nothing is in flight it lets
+// time pass, so that both ends send again.  The file that comes out must
+// be the file that went in, for each direction, for files of every
+// length that matters (none, one byte, a block less one, a block, a
+// block plus one, several blocks, an exact multiple), for block sizes
+// that are negotiated and ones that are not, and with each packet of a
+// short exchange lost in turn.
+
+use std.list
+use std.test
+use tftpwire
+use tftpxfer
+
+// The two mailboxes, the count of packets sent, the packets to lose and
+// the bytes the receiving end has taken.
+struct Net
+    var sent: Int
+    var lose: [Int]
+    var to_c: tftpwire.TftpPacket
+    var to_s: tftpwire.TftpPacket
+    var c_waits: Bool
+    var s_waits: Bool
+    var got: [Int]
+
+// The step that does nothing.
+fn nothing() -> tftpxfer.TftpStep
+    tftpxfer.TftpStep { action: tftpxfer.TFTP_ACT_NONE, block: 0, code: 0, deliver: false,
+                        len: 0, done: false, failed: false }
+
+// Put a packet in the mailbox of the other end, unless it is lost.
+fn post(var wire: Net, to_server: Bool, var pkt: tftpwire.TftpPacket)
+    let n = wire.sent
+    wire.sent = n + 1
+    if list.contains(wire.lose, n)
+        return
+    if to_server
+        wire.to_s = pkt
+        wire.s_waits = true
+    else
+        wire.to_c = pkt
+        wire.c_waits = true
+
+// The bytes of block `n` of `file`, appended to the DATA packet, and how
+// many there were.
+fn fill_block(var out: tftpwire.TftpPacket, file: [Int], n: Int, size: Int) -> Int
+    let start = (n - 1) * size
+    var count = 0
+    for i in 0..size
+        if start + i < list.len(file)
+            let _ = tftpwire.push_data(var out, file[start + i])
+            count = count + 1
+    count
+
+// Build the packet a step asks for and post it.
+fn act(var wire: Net, var x: tftpxfer.TftpXfer, st: tftpxfer.TftpStep, file: [Int], to_server: Bool)
+    var out: tftpwire.TftpPacket = Vec.new()
+    if st.action == tftpxfer.TFTP_ACT_NONE
+        return
+    var ok = false
+    if st.action == tftpxfer.TFTP_ACT_REQUEST
+        ok = tftpxfer.compose_request(var x, var out, "f.bin", "octet")
+    else
+        ok = tftpxfer.compose(var x, st, var out)
+    if not ok
+        test.fail("a step could not be composed")
+        return
+    if st.action == tftpxfer.TFTP_ACT_DATA
+        let n = fill_block(var out, file, st.block, tftpxfer.block_size(x))
+        tftpxfer.data_sent(var x, n)
+    post(var wire, to_server, var out)
+
+// Take the file bytes a DATA packet delivered.
+fn take(var wire: Net, var pkt: tftpwire.TftpPacket, st: tftpxfer.TftpStep)
+    if st.deliver
+        for i in 0..st.len
+            wire.got = list.push(wire.got, pkt[4 + i] as Int)
+
+// A file of `n` bytes, no two neighbours the same for a long way.
+fn file_of(n: Int) -> [Int]
+    var f: [Int] = []
+    for i in 0..n
+        f = list.push(f, (i * 7 + i / 256) % 251)
+    f
+
+// What an exchange came to.
+struct Outcome
+    got: [Int]
+    c_done: Bool
+    s_done: Bool
+    c_failed: Bool
+    s_failed: Bool
+    sent: Int
+    block: Int
+
+// Run a whole transfer.  `read` is true when the client reads the file
+// from the server and false when it writes it.  `ask_*` are the
+// client's options, `s_max` and `s_size` are the server's.
+fn run(read: Bool, file: [Int], ask_blk: Int, ask_to: Int, ask_ts: Int, s_max: Int, s_size: Int,
+       lose: [Int]) -> Outcome
+    var c = tftpxfer.client_write(ask_blk, ask_to, ask_ts)
+    if read
+        c = tftpxfer.client_read(ask_blk, ask_to, ask_ts)
+    // The server's transfer exists once a request has arrived.
+    var s = tftpxfer.client_read(-1, -1, -1)
+    var live = false
+    var wire = Net { sent: 0, lose: lose[:], to_c: Vec.new(), to_s: Vec.new(), c_waits: false,
+                    s_waits: false, got: [] }
+    let c_first = tftpxfer.start(var c)
+    act(var wire, var c, c_first, file, true)
+    for _step in 0..4000
+        if wire.s_waits
+            wire.s_waits = false
+            var st = nothing()
+            if live
+                // A request again, because the answer to the first was
+                // lost, reaches the listener on the well-known port and
+                // not this transfer: the listener sees the client's
+                // address and port and drops it.
+                let kind = tftpwire.opcode(var wire.to_s)
+                if kind != tftpwire.TFTP_OP_RRQ and kind != tftpwire.TFTP_OP_WRQ
+                    st = tftpxfer.on_packet(var s, var wire.to_s)
+                    take(var wire, var wire.to_s, st)
+            else
+                s = tftpxfer.server(tftpwire.parse_request(var wire.to_s), s_max, s_size)
+                live = true
+                st = tftpxfer.start(var s)
+            act(var wire, var s, st, file, false)
+        else if wire.c_waits
+            wire.c_waits = false
+            let st = tftpxfer.on_packet(var c, var wire.to_c)
+            take(var wire, var wire.to_c, st)
+            act(var wire, var c, st, file, true)
+        else
+            let finished = (tftpxfer.is_done(c) or tftpxfer.is_failed(c))
+                and (not live or tftpxfer.is_done(s) or tftpxfer.is_failed(s))
+            if finished
+                return Outcome { got: wire.got, c_done: tftpxfer.is_done(c),
+                                 s_done: tftpxfer.is_done(s), c_failed: tftpxfer.is_failed(c),
+                                 s_failed: tftpxfer.is_failed(s), sent: wire.sent,
+                                 block: tftpxfer.block_size(c) }
+            // Nothing is in flight: time passes for both ends.
+            let ct = tftpxfer.tick(var c, 100000)
+            act(var wire, var c, ct, file, true)
+            if live
+                let stt = tftpxfer.tick(var s, 100000)
+                act(var wire, var s, stt, file, false)
+    test.fail("the exchange did not finish")
+    Outcome { got: wire.got, c_done: false, s_done: false, c_failed: false, s_failed: false,
+              sent: wire.sent, block: 0 }
+
+// Whether an exchange moved `file` and both ends are done.
+fn moved(o: Outcome, file: [Int]) -> Bool
+    o.got == file and o.c_done and o.s_done
+
+@test
+fn test_files_of_every_length_go_both_ways() [io]
+    let lengths = [0, 1, 511, 512, 513, 1023, 1024, 1025, 2048, 5000]
+    for n in lengths
+        let file = file_of(n)
+        test.case("a client reads ${n} bytes")
+        test.assert(moved(run(true, file, -1, -1, -1, 512, n, []), file))
+        test.case("a client writes ${n} bytes")
+        test.assert(moved(run(false, file, -1, -1, -1, 512, 100000, []), file))
+
+@test
+fn test_negotiated_block_sizes_go_both_ways() [io]
+    let sizes = [8, 100, 512, 1024]
+    let lengths = [0, 7, 8, 9, 1000, 1024, 3000]
+    for b in sizes
+        for n in lengths
+            let file = file_of(n)
+            test.case("block size ${b}, ${n} bytes, read")
+            let r = run(true, file, b, 2, 0, 1024, n, [])
+            test.assert(moved(r, file))
+            test.assert_eq(r.block, b)
+            test.case("block size ${b}, ${n} bytes, write")
+            let w = run(false, file, b, 2, n, 1024, 100000, [])
+            test.assert(moved(w, file))
+            test.assert_eq(w.block, b)
+
+@test
+fn test_the_server_lowers_the_block_size_and_the_file_still_arrives() [io]
+    let file = file_of(3000)
+    let r = run(true, file, 1024, -1, -1, 600, 3000, [])
+    test.assert(moved(r, file))
+    test.assert_eq(r.block, 600)
+    let w = run(false, file, 1024, -1, -1, 600, 100000, [])
+    test.assert(moved(w, file))
+    test.assert_eq(w.block, 600)
+
+@test
+fn test_a_write_larger_than_the_room_fails_on_both_ends() [io]
+    let file = file_of(3000)
+    let w = run(false, file, -1, -1, 3000, 1024, 2000, [])
+    test.assert(w.c_failed)
+    test.assert(w.s_failed)
+    test.assert_eq(list.len(w.got), 0)
+
+@test
+fn test_each_packet_of_a_short_exchange_can_be_lost() [io]
+    // A read of 1100 bytes is the request, three DATA and three ACK
+    // (six packets after the request, seven in all); a write is the
+    // same.  Lose each in turn, then a few pairs.
+    let file = file_of(1100)
+    for k in 0..8
+        test.case("a read with packet ${k} lost")
+        test.assert(moved(run(true, file, -1, -1, -1, 512, 1100, [k]), file))
+        test.case("a write with packet ${k} lost")
+        test.assert(moved(run(false, file, -1, -1, -1, 512, 100000, [k]), file))
+        test.case("a read with options and packet ${k} lost")
+        test.assert(moved(run(true, file, 1024, 3, 0, 1024, 1100, [k]), file))
+        test.case("a write with options and packet ${k} lost")
+        test.assert(moved(run(false, file, 1024, 3, 1100, 1024, 100000, [k]), file))
+    test.case("two in a row")
+    test.assert(moved(run(true, file, -1, -1, -1, 512, 1100, [2, 3]), file))
+    test.assert(moved(run(false, file, -1, -1, -1, 512, 100000, [3, 4]), file))
+    test.assert(moved(run(true, file, -1, -1, -1, 512, 1100, [5, 6]), file))
+
+@test
+fn test_a_peer_that_never_answers_fails_the_transfer() [io]
+    // Every packet is lost, so the request is repeated and then the
+    // client gives up.
+    let file = file_of(10)
+    var everything: [Int] = []
+    for i in 0..200
+        everything = list.push(everything, i)
+    let o = run(true, file, -1, -1, -1, 512, 10, everything)
+    test.assert(o.c_failed)
+    test.assert_eq(o.sent, 6)

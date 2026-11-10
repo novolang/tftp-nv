@@ -1,0 +1,185 @@
+// tests/embedded_probe.nv — this package's device claim, as a program
+// that either builds for a Cortex-M or does not.
+//
+// THE CONSUMER IS A BOOTLOADER: a microcontroller that fetches its
+// firmware image from a TFTP server on the local network, one datagram
+// at a time, into a flash page, with no heap.  Everything it decides is
+// here: build the request, read the options the server agreed to, take
+// each block in order, acknowledge it, send the last acknowledgement
+// again if the server asks, and give up after a bounded number of
+// repeats.  The probe is that transfer compiled for the hardware, with
+// the server played by the other half of this package in the same
+// program, so a single image exercises both ends and the whole lock-step
+// exchange runs with no network.
+//
+// Two exchanges run: a client reads a 700-byte file with a negotiated
+// 256-byte block, and a client writes the same file at the default 512.
+// Each is checked byte by byte.  The score counts what held, and a
+// device that disagrees with the host prints how many checks it lost.
+//
+// The buffers are two packets of 1028 bytes and two transfers, all in the
+// frame; nothing is allocated.
+
+use std.str
+use tftpwire
+use tftpxfer
+
+// Byte `i` of the file both ends use.
+@tier(embedded)
+@no_alloc
+fn file_byte(i: Int) -> Int []
+    (i * 7 + 3) & 255
+
+// Append the bytes of block `n` of a file of `total` bytes to a DATA
+// packet, `size` to a block, and answer how many there were.
+@tier(embedded)
+@no_alloc
+fn fill(var out: TftpPacket, n: Int, size: Int, total: Int) -> Int []
+    let start = (n - 1) * size
+    var count = 0
+    for i in 0..size
+        if start + i < total
+            let _ = tftpwire.push_data(var out, file_byte(start + i))
+            count = count + 1
+    count
+
+// Check the bytes a step delivered against the file from `at`, and
+// answer how many were wrong.
+@tier(embedded)
+@no_alloc
+fn wrong_bytes(var pkt: TftpPacket, len: Int, at: Int) -> Int []
+    var bad = 0
+    for i in 0..len
+        if (pkt[4 + i] as Int) != file_byte(at + i)
+            bad = bad + 1
+    bad
+
+// Build what a step asks for in `out`, filling a DATA packet from the
+// file, and answer whether there is a packet to send.
+@tier(embedded)
+@no_alloc
+fn prepare(var x: TftpXfer, st: TftpStep, var out: TftpPacket, total: Int) -> Bool []
+    if st.action == tftpxfer.TFTP_ACT_NONE
+        return false
+    if st.action == tftpxfer.TFTP_ACT_REQUEST
+        return tftpxfer.compose_request(var x, var out, "fw.bin", "octet")
+    if not tftpxfer.compose(var x, st, var out)
+        return false
+    if st.action == tftpxfer.TFTP_ACT_DATA
+        let n = fill(var out, st.block, tftpxfer.block_size(x), total)
+        tftpxfer.data_sent(var x, n)
+    true
+
+// A client reads a file of 700 bytes from a server, asking for 256-byte
+// blocks.  Answers 1 when it arrived whole, in order, and both ends say
+// they are done, and 0 otherwise.
+@tier(embedded)
+@no_alloc
+fn read_exchange() -> Int []
+    var c = tftpxfer.client_read(256, 2, 0)
+    var s = tftpxfer.client_read(-1, -1, -1)
+    var to_s: TftpPacket = Vec.new()
+    var to_c: TftpPacket = Vec.new()
+    var c_step = tftpxfer.start(var c)
+    var s_step = c_step
+    var got = 0
+    var bad = 0
+    var live = false
+    for _i in 0..40
+        if prepare(var c, c_step, var to_s, 700)
+            if live
+                s_step = tftpxfer.on_packet(var s, var to_s)
+            else
+                s = tftpxfer.server(tftpwire.parse_request(var to_s), 512, 700)
+                live = true
+                s_step = tftpxfer.start(var s)
+        else
+            s_step = tftpxfer.tick(var s, 0)
+        if prepare(var s, s_step, var to_c, 700)
+            c_step = tftpxfer.on_packet(var c, var to_c)
+            if c_step.deliver
+                bad = bad + wrong_bytes(var to_c, c_step.len, got)
+                got = got + c_step.len
+        else
+            c_step = tftpxfer.tick(var c, 0)
+    if got == 700 and bad == 0 and tftpxfer.is_done(c) and tftpxfer.is_done(s)
+        return 1
+    0
+
+// A client writes the same file to a server that has room for 1000
+// bytes, at the default block size.
+@tier(embedded)
+@no_alloc
+fn write_exchange() -> Int []
+    var c = tftpxfer.client_write(-1, -1, 700)
+    var s = tftpxfer.client_read(-1, -1, -1)
+    var to_s: TftpPacket = Vec.new()
+    var to_c: TftpPacket = Vec.new()
+    var c_step = tftpxfer.start(var c)
+    var s_step = c_step
+    var got = 0
+    var bad = 0
+    var live = false
+    for _i in 0..40
+        if prepare(var c, c_step, var to_s, 700)
+            if live
+                s_step = tftpxfer.on_packet(var s, var to_s)
+                if s_step.deliver
+                    bad = bad + wrong_bytes(var to_s, s_step.len, got)
+                    got = got + s_step.len
+            else
+                s = tftpxfer.server(tftpwire.parse_request(var to_s), 1024, 1000)
+                live = true
+                s_step = tftpxfer.start(var s)
+        else
+            s_step = tftpxfer.tick(var s, 0)
+        if prepare(var s, s_step, var to_c, 700)
+            c_step = tftpxfer.on_packet(var c, var to_c)
+        else
+            c_step = tftpxfer.tick(var c, 0)
+    if got == 700 and bad == 0 and tftpxfer.is_done(c) and tftpxfer.is_done(s)
+        return 1
+    0
+
+// The packets, built and read back: five checks.
+@tier(embedded)
+@no_alloc
+fn wire_score() -> Int []
+    var n = 0
+    var p: TftpPacket = Vec.new()
+    if tftpwire.build_ack(var p, 0x0102) and p.len() == 4 and p[3] == 2
+        n = n + 1
+    if tftpwire.build_request(var p, tftpwire.TFTP_OP_RRQ, "a.bin", "octet", -1, -1, -1)
+        and p.len() == 14
+        n = n + 1
+    let r = tftpwire.parse_request(var p)
+    if r.ok and r.file_len == 5 and r.mode == tftpwire.TFTP_MODE_OCTET
+        n = n + 1
+    if tftpwire.build_oack(var p, 1024, -1, 4096) and tftpwire.classify(var p) == tftpwire.TFTP_OP_OACK
+        n = n + 1
+    let o = tftpwire.parse_options(var p, 2)
+    if o.blksize == 1024 and o.tsize == 4096
+        n = n + 1
+    n
+
+// Every answer this probe checks, folded into one number so a single
+// comparison decides the run.
+@tier(embedded)
+fn score() -> Int []
+    wire_score() + read_exchange() + write_exchange()
+
+@tier(rt)
+fn main() [hw]
+    bsp.board.init()
+    // 7 is the number of checks in `score`.  The count is printed on a
+    // failure rather than only compared, so a device that disagrees with
+    // the host says how many it lost.
+    let n = score()
+    if n == 7
+        hal.uart.write("PASS: tftp-embedded\n")
+    else
+        hal.uart.write("FAIL: tftp-embedded score=")
+        hal.uart.write(str.from_int(n))
+        hal.uart.write("\n")
+    loop
+        hal.timer.delay_ms(1000)
