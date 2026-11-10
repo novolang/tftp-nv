@@ -224,7 +224,7 @@ fn seal(var out: TftpPacket, ok: Bool) -> Bool []
 // fn main() [io]
 //     var p: tftpwire.TftpPacket = Vec.new()
 //     let ok = tftpwire.build_request(var p, tftpwire.TFTP_OP_RRQ, "a.bin", "octet", -1, -1, -1)
-//     println("${ok} ${p.len()}")   // true 15
+//     println("${ok} ${p.len()}")   // true 14
 // ```
 pub @tier(embedded)
 @no_alloc
@@ -315,7 +315,7 @@ fn build_error(var out: TftpPacket, code: Int, message: Str) -> Bool []
 // fn main() [io]
 //     var p: tftpwire.TftpPacket = Vec.new()
 //     let ok = tftpwire.build_oack(var p, 1024, -1, 4096)
-//     println("${ok} ${p.len()}")   // true 28
+//     println("${ok} ${p.len()}")   // true 26
 // ```
 pub @tier(embedded)
 @no_alloc
